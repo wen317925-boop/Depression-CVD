@@ -1,0 +1,2467 @@
+﻿##安装包（仅在需要时运行）
+install.packages("haven")
+install.packages("dplyr")
+install.packages("tidyr")
+install.packages("readr")
+install.packages("zoo")
+install.packages("data.table")
+install.packages("gfoRmula")
+install.packages("EValue")
+install.packages("stringr")
+install.packages("forestplot")
+install.packages("grid")
+install.packages("mice")
+install.packages("splines")
+#==================== 0) 加载包 ====================
+library(haven)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(zoo)
+library(data.table)
+library(gfoRmula)
+library(EValue)
+library(stringr)
+library(forestplot)
+library(grid)
+library(mice)
+library(splines)
+
+##----------------------------------------------------------------##
+#==================== 读取ELSA R数据 ====================
+load("C:\\Users\\D2646\\Desktop\\2.7\\ELSA\\elsa.RData")
+
+#==================== 挑选变量 + 改名 ====================
+rcvd <- elsa[, c("idauniqc", "wave", "iwstat", "iwindm","iwindy", "radyear",
+                 "agey", "ragender", "raracem", "raeduc_e", "raeducl", "mstath",
+                 "hearte", "stroke", "angine", "hrtatte", "conhrtfe",
+                 "angin", "hrtatt", "hatotb", "retemp", "cesd",
+                 "itearn","hitot","smoken","ltactx_e","mdactx_e","vgactx_e","drink","group1", "group2", "group3", "group4", "group5", "group6", "group7", "group8")]
+
+rcvd <- rcvd %>% rename(ID = idauniqc,
+                        raeduc_c = raeducl,
+                        drinkl = drink)
+
+#==================== 描述变量、查看变量编码（分类变量） ====================
+table(as_factor(rcvd$raeduc_c))
+attributes(rcvd$raeduc_c)
+
+#--------查看ID wave---------
+rcvd_summary <- rcvd %>%
+  group_by(wave) %>%
+  summarise(ID_count = n_distinct(ID), .groups = "drop")
+print(rcvd_summary)
+
+#查看变量缺失情况
+print(colSums(is.na(rcvd)))
+print(colMeans(is.na(rcvd)))
+
+################################################################################
+# Part 1：基线数据清理（不看协变量） + 随访删失（截断：缺波 OR 关键变量缺失）
+# ——完全按 CHARLS 逻辑：截断只看 key（CVD/cesd）+ gap，不把协变量缺失当删失——
+################################################################################
+
+#==================== 1) 定义CVD（ELSA：5个成分） ====================
+add_cvd_elsa <- function(df){
+  cvd_vars <- c("hearte","stroke","angine","hrtatte","conhrtfe")
+  df %>%
+    mutate(
+      CVD = case_when(
+        if_any(all_of(cvd_vars), ~ .x == 1) ~ 1L,
+        if_all(all_of(cvd_vars), ~ is.na(.x)) ~ NA_integer_,
+        TRUE ~ 0L
+      )
+    )
+}
+
+#==================== 2) 限定窗口（wave4-9）+ 生成CVD ====================
+need_waves <- 4:9
+rcvd_win <- rcvd %>%
+  mutate(wave = as.integer(wave)) %>%
+  filter(wave %in% need_waves) %>%
+  add_cvd_elsa() %>%
+  arrange(ID, wave)
+
+#==================== 3) 基线（wave4）筛选：年龄>=50 + cesd/CVD不缺失 + 基线无CVD ====================
+wave4 <- rcvd_win %>% filter(wave == 4)
+
+ids0 <- sort(unique(wave4$ID)); n0 <- length(ids0)
+
+ids1 <- wave4 %>% filter(!is.na(agey) & agey >= 50) %>% distinct(ID) %>% pull(ID) %>% sort()
+rm1  <- length(setdiff(ids0, ids1)); n1 <- length(ids1)
+
+ids2 <- wave4 %>% filter(ID %in% ids1, !is.na(cesd)) %>% distinct(ID) %>% pull(ID) %>% sort()
+rm2  <- length(setdiff(ids1, ids2)); n2 <- length(ids2)
+
+ids3 <- wave4 %>% filter(ID %in% ids2, !is.na(CVD)) %>% distinct(ID) %>% pull(ID) %>% sort()
+rm3  <- length(setdiff(ids2, ids3)); n3 <- length(ids3)
+
+ids4 <- wave4 %>% filter(ID %in% ids3, CVD == 0) %>% distinct(ID) %>% pull(ID) %>% sort()
+rm4  <- length(setdiff(ids3, ids4)); n4 <- length(ids4)
+
+# 基线通过后的队列（保留窗口内所有记录）
+rcvd_base <- rcvd_win %>% filter(ID %in% ids4)
+
+#==================== 4) 随访删失（截断）：缺波 OR 关键变量缺失 => 截断到删失点之前 ====================
+# 关键变量：CVD、cesd（不看协变量，完全按 CHARLS）
+rcvd_cens <- rcvd_base %>%
+  group_by(ID) %>%
+  arrange(wave, .by_group = TRUE) %>%
+  mutate(
+    wave_expect  = first(wave) + row_number() - 1L,
+    gap_row      = (wave != wave_expect),
+    miss_key_row = is.na(CVD) | is.na(cesd),
+    stop_row     = gap_row | miss_key_row,
+    after_stop   = cumsum(stop_row) > 0
+  ) %>%
+  filter(!after_stop) %>%
+  mutate(t0 = row_number() - 1L) %>%
+  ungroup() %>%
+  select(-wave_expect, -gap_row, -miss_key_row, -stop_row, -after_stop)
+
+#==================== 5) 至少两次连续访视：截断后每人至少保留≥2条记录 ====================
+id_nwave <- rcvd_cens %>% count(ID, name = "nwave")
+ids5 <- id_nwave %>% filter(nwave >= 2) %>% pull(ID) %>% sort()
+
+rm5_consec2 <- length(setdiff(ids4, ids5))
+n5 <- length(ids5)
+
+rcvd_base_clean_cens <- rcvd_cens %>% filter(ID %in% ids5)
+
+#==================== 6) 基线清理流程汇总 ====================
+flow_baseline <- tibble(
+  step = c(
+    "Step0 初始：wave4有记录的ID数",
+    "Step1 删除：wave4年龄缺失或<50",
+    "Step2 删除：基线(wave4) cesd缺失",
+    "Step3 删除：基线(wave4) CVD缺失（5项全缺失）",
+    "Step4 删除：基线(wave4) CVD=1（有CVD）",
+    "Step5 删除：随访截断后不足2次连续访视（<2条记录）",
+    "Final 最终纳入ID数（基线清理+截断后）"
+  ),
+  removed   = c(0, rm1, rm2, rm3, rm4, rm5_consec2, NA),
+  remaining = c(n0, n1, n2, n3, n4, n5, n5)
+)
+print(flow_baseline)
+
+
+################################################################################
+# Part 2：缺失值LOCF填补（仅协变量；在 Part 1 的最终数据上进行）
+################################################################################
+
+# 需要LOCF的协变量集合（按你原列表）
+cov_vars <- c( "smoken","drinkl", "raeduc_c","ltactx_e", "mdactx_e", "vgactx_e")
+
+# 先转数值（labelled 更稳）
+rcvd_base_clean_cens2 <- rcvd_base_clean_cens %>%
+  mutate(across(all_of(cov_vars), ~ suppressWarnings(as.numeric(.x))))
+
+# 只向前LOCF工具
+locf_forward <- function(df, vars){
+  df %>%
+    arrange(ID, wave) %>%
+    group_by(ID) %>%
+    mutate(across(all_of(vars), ~ zoo::na.locf(.x, na.rm = FALSE))) %>%
+    ungroup()
+}
+
+# 执行LOCF
+rcvd_locf <- locf_forward(rcvd_base_clean_cens2, cov_vars)
+
+#=============================
+# 4) 行政性截尾：LOCF后仍缺失 -> 在首次缺失wave截尾，删除其后所有波次（含该波次）
+#=============================
+admin_trunc_on_missing <- function(df, vars){
+  df %>%
+    group_by(ID) %>%
+    mutate(
+      first_miss_wave = suppressWarnings(min(wave[if_any(all_of(vars), is.na)], na.rm = TRUE)),
+      first_miss_wave = ifelse(is.infinite(first_miss_wave), NA, first_miss_wave)
+    ) %>%
+    ungroup() %>%
+    filter(is.na(first_miss_wave) | wave < first_miss_wave) %>%   # <- 不保留首次缺失wave及之后
+    select(-first_miss_wave)
+}
+
+rcvd_locf <- admin_trunc_on_missing(rcvd_locf, cov_vars)
+
+print(colSums(is.na(rcvd_locf[, cov_vars])))
+n_id_after <- dplyr::n_distinct(rcvd_locf$ID)
+cat("截尾后ID数 =", n_id_after, "\n")
+
+
+# LOCF后协变量仍缺失情况（可看一下）
+print(colSums(is.na(rcvd_locf[, cov_vars])))
+
+#==================== ✅ 保持“就用 rcvd”：把最终数据写回 rcvd ====================
+rcvd_raw <- rcvd
+rcvd <- rcvd_locf
+
+stopifnot(all(c("ID","wave","t0","cesd","CVD") %in% names(rcvd)))
+
+
+################################################################################
+# 变量编码（基于最终 rcvd；与 CHARLS 一样：在最终数据上编码）
+################################################################################
+
+# depression：是=1 否=0
+dep_cut <- 3
+rcvd <- rcvd %>%
+  mutate(depression = as.integer(cesd >= dep_cut))
+
+# 年龄组（50-59 / >=60） -> 二元 0/1（与 CHARLS 风格一致）
+rcvd$age_group <- cut(rcvd$agey,
+                      breaks = c(50, 60, Inf),
+                      right  = FALSE,
+                      labels = c("50-59years", ">60years"))
+
+# 体力活动：2/3/4=有；5=几乎没有；三项任一“有” => exercise=1
+ex_vars <- c("ltactx_e", "mdactx_e", "vgactx_e")
+rcvd <- rcvd %>%
+  mutate(across(all_of(ex_vars), ~ as.numeric(.))) %>%
+  mutate(
+    lt_bin = case_when(ltactx_e %in% c(2,3,4) ~ 1L, ltactx_e == 5 ~ 0L, TRUE ~ NA_integer_),
+    md_bin = case_when(mdactx_e %in% c(2,3,4) ~ 1L, mdactx_e == 5 ~ 0L, TRUE ~ NA_integer_),
+    vg_bin = case_when(vgactx_e %in% c(2,3,4) ~ 1L, vgactx_e == 5 ~ 0L, TRUE ~ NA_integer_),
+    exercise = as.integer((lt_bin + md_bin + vg_bin) > 0)
+  ) %>%
+  select(-lt_bin, -md_bin, -vg_bin)
+
+
+# 教育（合并）
+rcvd <- rcvd %>%
+  mutate(
+    raeduc_c = case_when(
+      raeduc_c %in% c(1) ~ 0L,
+      raeduc_c %in% c(2, 3) ~ 1L,
+      TRUE ~ NA_integer_
+    )
+  )
+
+print(colSums(is.na(rcvd)))
+print(colMeans(is.na(rcvd)))
+
+
+#=========================因子（按你原编码方式保留）=========================
+rcvd$ragender <- factor(rcvd$ragender, levels = c(0, 1), labels = c("Woman", "Man"))
+rcvd$nation   <- factor(rcvd$raracem,  levels = c(0, 1), labels = c("no white", "white"))
+rcvd$CVD      <- factor(rcvd$CVD,      levels = c(0, 1), labels = c("No", "Yes"))
+rcvd$depression <- factor(rcvd$depression, levels = c(0, 1), labels = c("No", "Yes"))
+rcvd$age_group  <- factor(rcvd$age_group, levels = c("50-59years",">60years"))
+rcvd$smoken   <- factor(rcvd$smoken,   levels = c(0, 1), labels = c("No", "Yes"))
+rcvd$exercise <- factor(rcvd$exercise, levels = c(0, 1), labels = c("No", "Yes"))
+rcvd$drinkl <- factor(rcvd$drinkl, levels = c(0, 1), labels = c("No", "Yes"))
+rcvd$raeduc_c <- factor(rcvd$raeduc_c, levels = c(0, 1),
+                        labels = c("below high school", "high school or above"))
+#=========================转成数值（与 CHARLS 风格一致）=========================
+rcvd <- rcvd %>%
+  mutate(
+    CVD        = as.integer(as.character(CVD)        %in% c("Yes", "1")),
+    depression = as.integer(as.character(depression) %in% c("Yes", "1")),
+    smoken     = as.integer(as.character(smoken)     %in% c("Yes", "1")),
+    exercise   = as.integer(as.character(exercise)   %in% c("Yes", "1")),
+    ragender   = as.integer(as.character(ragender)   %in% c("Man", "1")),
+    nation     = as.integer(as.character(nation)     %in% c("white", "1")),
+    age_group  = as.integer(as.character(age_group)  %in% c(">60years", "1")),
+    drinkl  = as.integer(as.character(drinkl)  %in% c("Yes", "1")),
+    raeduc_c   = as.integer(as.character(raeduc_c)   %in% c("high school or above", "1"))
+  )
+
+#==================== 基线期年龄的均数和标准差 ====================
+
+baseline_age <- rcvd %>%
+  filter(wave == 4) %>%        # 基线期
+  summarise(
+    n        = sum(!is.na(agey)),
+    mean_age = mean(agey, na.rm = TRUE),
+    sd_age   = sd(agey, na.rm = TRUE)
+  )
+
+print(baseline_age)
+
+
+#==================== ✅ 关键：构造 survival 结局 CVD_surv，并删掉事件后随访（与 CHARLS 一致）=====================
+rcvd <- rcvd %>%
+  group_by(ID) %>%
+  arrange(t0, .by_group = TRUE) %>%
+  mutate(
+    CVD_cum  = cummax(CVD),
+    CVD_surv = as.integer(CVD_cum == 1L & lag(CVD_cum, default = 0L) == 0L),
+    post_event = (cummax(CVD_surv) == 1L & CVD_surv == 0L)
+  ) %>%
+  filter(!post_event) %>%
+  ungroup() %>%
+  select(-CVD_cum, -post_event)
+
+#（可选）检查：每人t0是否从0开始且连续
+chk <- rcvd %>%
+  arrange(ID, t0) %>%
+  group_by(ID) %>%
+  summarise(
+    start0 = first(t0) == 0,
+    consec = all(diff(t0) == 1),
+    any_miss_y = any(is.na(CVD_surv)),
+    .groups = "drop"
+  )
+print(table(chk$start0, chk$consec))
+print(sum(chk$any_miss_y))
+
+################################################################################
+# gfoRmula 部分（保持你原思路/模型/干预）
+################################################################################
+
+setDT(rcvd)
+id <- "ID"
+time_name <- "t0"
+outcome_name <- "CVD_surv"
+outcome_type <- "survival"
+basecovs <- c("ragender","nation","raeduc_c","age_group")
+time_points <- max(rcvd[[time_name]], na.rm = TRUE) + 1L
+
+wrap_time <- function(ints, time_points) {
+  lapply(ints, function(L) lapply(L, function(f) rep(list(f), time_points)))
+}
+
+##=================== Run A：主分析 ===================
+covnames_A  <- c( "exercise",  "smoken", "drinkl","depression")
+covtypes_A  <- c( "binary",  "binary", "binary", "binary")
+histories_A <- list(lagged)
+histvars_A  <- list(c("exercise","smoken","drinkl","depression"))
+
+covparams_A <- list(
+  covmodels = c(
+    exercise ~ t0,
+    smoken ~ t0,
+    drinkl ~ nation + t0,
+    depression ~ lag1_depression + ragender + nation + exercise + raeduc_c + t0
+  )
+)
+
+ymodel_A <- CVD_surv ~ depression + ragender + nation + age_group + lag1_smoken  + exercise + drinkl + t0
+# 可选：+ splines::ns(t0, df=3)
+
+## (1) 全人群可行性：随机将 50% 抑郁个体改为 0
+intervention_feasible_overall <- function(newdf, pool, intvar, intvals, time_name, t) {
+  data.table::setDT(newdf)
+  newdf[ runif(.N) < 0.5 & get(intvar) == 1L, (intvar) := 0L ]
+  newdf
+}
+
+## (2) 全人群强化：将所有抑郁个体改为 0
+intervention_intensified_overall <- function(newdf, pool, intvar, intvals, time_name, t) {
+  data.table::setDT(newdf)
+  newdf[ get(intvar) == 1L, (intvar) := 0L ]
+  newdf
+}
+
+ints_A  <- list()
+desc_A  <- character(0)
+
+ints_A[["int1_overall_50"]] <- list(intervention_feasible_overall)
+desc_A <- c(desc_A, "Overall: 50% of depressed -> non-depressed")
+
+ints_A[["int2_overall_100"]] <- list(intervention_intensified_overall)
+desc_A <- c(desc_A, "Overall: 100% of depressed -> non-depressed")
+
+intvars_A       <- lapply(names(ints_A), function(nm) "depression")
+interventions_A <- wrap_time(ints_A, time_points)
+
+args_A <- list(
+  obs_data      = rcvd,
+  id            = id,
+  time_name     = time_name,
+  time_points   = time_points,
+  covnames      = covnames_A,
+  covtypes      = covtypes_A,
+  covparams     = covparams_A,
+  basecovs      = basecovs,
+  histories     = histories_A,
+  histvars      = histvars_A,
+  outcome_name  = outcome_name,
+  ymodel        = ymodel_A,
+  outcome_type  = outcome_type,
+  nsimul        = 2,
+  nsamples      = 1,
+  seed          = 4321,
+  int_descript  = desc_A,
+  intvars       = intvars_A,
+  interventions = interventions_A
+)
+
+gform_A <- do.call(gformula, args_A)
+summary(gform_A)
+
+
+
+
+
+##=================== Run B：抑郁状态亚组分析 ===================
+## —— 协变量设置（同原代码，不变）——
+covnames_B  <- c( "exercise" ,"smoken", "drinkl","depression")
+covtypes_B  <- c( "binary",  "binary", "binary", "binary")
+histories_B <- list(lagged)
+histvars_B  <- list(c("exercise","smoken","drinkl","depression"))
+
+covparams_B <- list(
+  covmodels = c(
+    exercise ~ t0,
+    smoken ~ t0,
+    drinkl ~ nation + t0,
+    depression ~ lag1_depression + ragender + nation + exercise + raeduc_c + t0
+  )
+)
+
+ymodel_B <- CVD_surv ~ depression + ragender + nation + age_group + lag1_smoken  + exercise + drinkl + t0
+# 可选：+ splines::ns(t0, df=3)
+
+
+## —— 干预函数——
+## (3) 分层：某一层内 50% 或 100% 的抑郁个体转变为无抑郁
+make_half_fun <- function(group_var, level) {
+  force(group_var); force(level)
+  function(newdf, pool, intvar, intvals, time_name, t) {
+    data.table::setDT(newdf)
+    idx <- (newdf[[group_var]] == level) & (newdf[[intvar]] == 1L) & (runif(nrow(newdf)) < 0.5)
+    newdf[idx, (intvar) := 0L]
+    newdf
+  }
+}
+
+make_all_fun <- function(group_var, level) {
+  force(group_var); force(level)
+  function(newdf, pool, intvar, intvals, time_name, t) {
+    data.table::setDT(newdf)
+    idx <- (newdf[[group_var]] == level) & (newdf[[intvar]] == 1L)
+    newdf[idx, (intvar) := 0L]
+    newdf
+  }
+}
+
+## —— 初始化干预列表 —— 
+ints_B <- list()
+desc_B <- character(0)
+iB <- 1L
+
+## ---------- 年龄分层 age_group ----------
+age_levels    <- sort(unique(rcvd$age_group))
+age_label_for <- function(v) as.character(v)
+
+for (lev in age_levels) {
+  ints_B[[sprintf("int%d_age_%s_50", iB, lev)]] <- list(make_half_fun("age_group", lev))
+  desc_B <- c(desc_B, sprintf("Age %s: 50%% of depressed -> non-depressed", age_label_for(lev)))
+  iB <- iB + 1
+
+  ints_B[[sprintf("int%d_age_%s_100", iB, lev)]] <- list(make_all_fun("age_group", lev))
+  desc_B <- c(desc_B, sprintf("Age %s: 100%% of depressed -> non-depressed", age_label_for(lev)))
+  iB <- iB + 1
+}
+
+## ---------- 性别分层 ragender ----------
+sex_levels <- sort(unique(rcvd$ragender))
+sex_label  <- function(v) ifelse(v == 1, "Man", "Woman")
+
+for (lev in sex_levels) {
+  ints_B[[sprintf("int%d_sex_%s_50", iB, sex_label(lev))]] <- list(make_half_fun("ragender", lev))
+  desc_B <- c(desc_B, sprintf("Sex %s: 50%% of depressed -> non-depressed", sex_label(lev)))
+  iB <- iB + 1
+
+  ints_B[[sprintf("int%d_sex_%s_100", iB, sex_label(lev))]] <- list(make_all_fun("ragender", lev))
+  desc_B <- c(desc_B, sprintf("Sex %s: 100%% of depressed -> non-depressed", sex_label(lev)))
+  iB <- iB + 1
+}
+
+
+## ---------- 吸烟分层 smoken ----------
+smoke_levels <- sort(unique(rcvd$smoken))
+smoke_label  <- function(v) ifelse(v == 1, "Smoker", "Non-smoker")
+
+for (lev in smoke_levels) {
+  ints_B[[sprintf("int%d_smoke_%s_50", iB, lev)]] <- list(make_half_fun("smoken", lev))
+  desc_B <- c(desc_B, sprintf("Smoking status %s: 50%% of depressed -> non-depressed", smoke_label(lev)))
+  iB <- iB + 1
+
+  ints_B[[sprintf("int%d_smoke_%s_100", iB, lev)]] <- list(make_all_fun("smoken", lev))
+  desc_B <- c(desc_B, sprintf("Smoking status %s: 100%% of depressed -> non-depressed", smoke_label(lev)))
+  iB <- iB + 1
+}
+
+## ---------- 饮酒分层 drinkl（你数据里是 drinkl，且后面编码成 0/1 数值） ----------
+drink_levels <- sort(unique(rcvd$drinkl))
+drink_label  <- function(v) ifelse(v == 1, "Drinker", "Non-drinker")
+
+for (lev in drink_levels) {
+  ints_B[[sprintf("int%d_drink_%s_50", iB, lev)]] <- list(make_half_fun("drinkl", lev))
+  desc_B <- c(desc_B, sprintf("Drinking status %s: 50%% of depressed -> non-depressed", drink_label(lev)))
+  iB <- iB + 1
+
+  ints_B[[sprintf("int%d_drink_%s_100", iB, lev)]] <- list(make_all_fun("drinkl", lev))
+  desc_B <- c(desc_B, sprintf("Drinking status %s: 100%% of depressed -> non-depressed", drink_label(lev)))
+  iB <- iB + 1
+}
+
+
+## ---------- 身体活动分层 exercise ----------
+exercise_levels <- sort(unique(rcvd$exercise))
+exercise_label  <- function(v) ifelse(v == 1, "Yes", "No")
+
+for (lev in exercise_levels) {
+  ints_B[[sprintf("int%d_exercise_%s_50",  iB, exercise_label(lev))]] <- list(make_half_fun("exercise", lev))
+  desc_B <- c(desc_B, sprintf("Exercise %s: 50%% of depressed -> non-depressed", exercise_label(lev)))
+  iB <- iB + 1
+
+  ints_B[[sprintf("int%d_exercise_%s_100", iB, exercise_label(lev))]] <- list(make_all_fun("exercise", lev))
+  desc_B <- c(desc_B, sprintf("Exercise %s: 100%% of depressed -> non-depressed", exercise_label(lev)))
+  iB <- iB + 1
+}
+
+
+## 固定：Run B 这些分层干预仍然只作用于 depression
+intvars_B       <- lapply(names(ints_B), function(nm) "depression")
+interventions_B <- wrap_time(ints_B, time_points)
+
+stopifnot(length(ints_B) == length(desc_B))
+stopifnot(length(ints_B) == length(intvars_B))
+
+## =================== 运行 Run B ===================
+args_B <- list(
+  obs_data      = rcvd,
+  id            = id,
+  time_name     = time_name,
+  time_points   = time_points,
+  covnames      = covnames_B,
+  covtypes      = covtypes_B,
+  covparams     = covparams_B,
+  basecovs      = basecovs,
+  histories     = histories_B,
+  histvars      = histvars_B,
+  outcome_name  = outcome_name,
+  ymodel        = ymodel_B,
+  outcome_type  = outcome_type,
+  nsimul        = 2,
+  nsamples      = 1,
+  seed          = 4321,
+  int_descript  = desc_B,
+  intvars       = intvars_B,
+  interventions = interventions_B
+)
+
+gform_B <- do.call(gformula, args_B)
+summary(gform_B)
+
+
+##=================== Run C：抑郁得分亚组分析 ===================
+## 1. 协变量设置：保持你原来的设定不变
+##    （depression 在这里主要用于分组求中位数和建模，不进入结局）
+
+covnames_C  <- c("exercise","smoken","drinkl","cesd","depression")
+covtypes_C  <- c("binary","binary","binary","normal","binary")
+histories_C <- list(lagged, lagavg)
+histvars_C  <- list(
+  c("exercise","smoken","drinkl","cesd","depression"),  # lagged 历史
+  c("cesd")                                  # 累积平均
+)
+
+covparams_C <- list(
+  covmodels = c(
+    exercise ~ t0,
+    smoken ~ t0,
+    drinkl ~ nation + t0,
+   cesd ~ ragender + nation + exercise + lag_cumavg1_cesd + raeduc_c + t0,
+    depression ~ lag1_depression + ragender + nation + exercise + raeduc_c + t0
+  )
+)
+
+## 2. 结局模型：只用 CESD 及其历史
+ymodel_C <- CVD_surv ~ cesd + lag1_cesd + ragender + nation + age_group + lag1_smoken  + exercise + drinkl + t0
+
+
+
+## 1) 计算：基线(t0==0) “不抑郁人群(cesd < dep_cut)” 的 P75/P50/P25
+setDT(rcvd)
+
+q_nondep <- quantile(
+  rcvd[t0 == 0 & cesd < dep_cut, cesd],
+  probs  = c(0.75, 0.50, 0.25),
+  na.rm  = TRUE
+)
+
+q75_nondep <- as.numeric(q_nondep[["75%"]])
+q50_nondep <- as.numeric(q_nondep[["50%"]])
+q25_nondep <- as.numeric(q_nondep[["25%"]])
+
+## 2) 干预小工具：只对“抑郁人群(cesd >= dep_cut)”把分数降到 target
+make_dep_to_target_fun <- function(target) {
+  force(target)
+  function(newdf, pool, intvar, intvals, time_name, t) {
+    setDT(newdf)
+    col <- as.character(intvar)[1]   # "cesd"
+    x   <- newdf[[col]]
+
+    idx_dep <- (!is.na(x)) & (x >= dep_cut)   # 只对当前时点抑郁者动手
+
+    x_new <- x
+    x_new[idx_dep] <- pmin(x[idx_dep], target)
+
+    newdf[, (col) := x_new]
+    return(newdf)
+  }
+}
+
+## 3) 4个干预：抑郁 -> 不抑郁 P75 / P50 / P25 / 0
+int_dep_to_nonDepP75 <- make_dep_to_target_fun(q75_nondep)
+int_dep_to_nonDepP50 <- make_dep_to_target_fun(q50_nondep)
+int_dep_to_nonDepP25 <- make_dep_to_target_fun(q25_nondep)
+
+int_dep_to_0 <- function(newdf, pool, intvar, intvals, time_name, t) {
+  setDT(newdf)
+  col <- as.character(intvar)[1]
+  x   <- newdf[[col]]
+
+  idx_dep <- (!is.na(x)) & (x >= dep_cut)
+  x_new <- x
+  x_new[idx_dep] <- 0
+
+  newdf[, (col) := x_new]
+  return(newdf)
+}
+
+## 4) gformula：Run C
+gform_C <- gformula(
+  obs_data     = rcvd,
+  id           = id,
+  time_name    = time_name,
+  time_points  = time_points,
+  covnames     = covnames_C,
+  covtypes     = covtypes_C,
+  covparams    = covparams_C,
+  basecovs     = basecovs,
+  histories    = histories_C,
+  histvars     = histvars_C,
+  outcome_name = outcome_name,
+  ymodel       = ymodel_C,
+  outcome_type = outcome_type,
+  nsimul       = 2,
+  nsamples     = 1,
+  seed         = 4321,
+
+  int_descript = c(
+    sprintf("Interv1: Depressed(>= %d) -> Non-depressed P75 (%.2f)", dep_cut, q75_nondep),
+    sprintf("Interv2: Depressed(>= %d) -> Non-depressed P50 (%.2f)", dep_cut, q50_nondep),
+    sprintf("Interv3: Depressed(>= %d) -> Non-depressed P25 (%.2f)", dep_cut, q25_nondep),
+    sprintf("Interv4: Depressed(>= %d) -> 0", dep_cut)
+  ),
+
+  intervention1.cesd = list(int_dep_to_nonDepP75),
+  intervention2.cesd = list(int_dep_to_nonDepP50),
+  intervention3.cesd = list(int_dep_to_nonDepP25),
+  intervention4.cesd = list(int_dep_to_0)
+)
+
+summary(gform_C)
+
+
+
+#===============================敏感性分析（只做A）===========================
+#——————E-value：未测量混杂（基于 gformula 输出的 Risk ratio）——————
+
+library(dplyr)
+
+tabA <- as.data.frame(gform_A$result)
+
+# 1) 用你需要的 RR / CI 列（注意：现在不是 Mean ratio）
+tabA_rr <- tabA %>%
+  mutate(
+    RR       = `Risk ratio`,
+    RR_lower = `RR lower 95% CI`,
+    RR_upper = `RR upper 95% CI`
+  )
+
+# 2) E-value 计算函数（只对 >1 的RR计算；<=1 给1）
+calc_E <- function(rr) {
+  out <- rep(1, length(rr))
+  idx <- which(!is.na(rr) & rr > 1)
+  out[idx] <- rr[idx] + sqrt(rr[idx] * (rr[idx] - 1))
+  out
+}
+
+# 3) 把保护性效应（RR<1）翻到 >1 方向，再算 E-value
+tabA_ev <- tabA_rr %>%
+  mutate(
+    # 翻转到“有害方向”（>1），便于套用E-value公式
+    est_use = ifelse(!is.na(RR) & RR < 1, 1/RR, RR),
+
+    # RR<1 时，CI 翻转要“对调”：lower_use = 1/upper_raw, upper_use = 1/lower_raw
+    lo_use  = ifelse(!is.na(RR) & RR < 1, 1/RR_upper, RR_lower),
+    hi_use  = ifelse(!is.na(RR) & RR < 1, 1/RR_lower, RR_upper),
+
+    Evalue_point = calc_E(est_use),
+    # 按 E-value 定义，用“更靠近1的那一侧”（翻转后就是 lo_use）来算CI的E-value
+    Evalue_CI    = calc_E(lo_use)
+  ) %>%
+  select(k, Interv., RR, RR_lower, RR_upper, Evalue_point, Evalue_CI)
+
+tabA_ev
+
+
+##===============敏感性分析：时间顺序/反向因果=====================
+## —— 结局模型使用滞后1期抑郁 lag1_depression —— 
+##==============================================================
+
+##------------------------
+## 0) 基础检查
+##------------------------
+stopifnot(exists("args_A"), is.list(args_A), "obs_data" %in% names(args_A))
+stopifnot(all(c("id", "time_name") %in% names(args_A)))
+
+##------------------------
+## 1) 取主分析数据（保持结构一致）
+##------------------------
+rcvd_sens <- data.table::copy(as.data.table(args_A$obs_data))
+
+idv <- args_A$id
+tv  <- args_A$time_name
+
+## 兼容：ELSA 若用 raracem，则补 nation
+if (!"nation" %in% names(rcvd_sens) && "raracem" %in% names(rcvd_sens)) {
+  rcvd_sens[, nation := raracem]
+}
+
+##------------------------
+## 2) 确保 lag1_depression / lag1_smoken 存在，并给每人首期填充（避免 NA 影响拟合）
+##------------------------
+data.table::setorderv(rcvd_sens, c(idv, tv))
+
+rcvd_sens[, lag1_depression := data.table::shift(depression, 1L, type = "lag"), by = idv]
+rcvd_sens[, lag1_smoken     := data.table::shift(smoken,     1L, type = "lag"), by = idv]
+
+## 首期用自身值填充（你原敏感性分析里的做法）
+rcvd_sens[is.na(lag1_depression), lag1_depression := depression]
+rcvd_sens[is.na(lag1_smoken),     lag1_smoken     := smoken]
+
+##------------------------
+## 3) 反向因果敏感性：结局模型用滞后1期抑郁
+##    （其余结构沿用主分析；这里也纳入 income_group / exercise 以更稳健）
+##------------------------
+ymodel_A_lag1 <- CVD_surv ~ lag1_depression + ragender + nation + age_group + lag1_smoken  + exercise + drinkl + t0
+
+
+##------------------------
+## 4) 复制主分析参数，只替换 ymodel 和 obs_data
+##------------------------
+args_A_lag1 <- args_A
+args_A_lag1$obs_data <- rcvd_sens
+args_A_lag1$ymodel   <- ymodel_A_lag1
+
+##------------------------
+## 5) 运行
+##------------------------
+set.seed(20260115)
+gform_A_lag1 <- do.call(gformula, args_A_lag1)
+
+summary(gform_A_lag1)
+
+
+##排除随访早期事件（洗掉最早1个区间，t0==0）
+##==============================================================
+##------------------------
+## 0) 基础检查
+##------------------------
+stopifnot(exists("args_A"), is.list(args_A), "obs_data" %in% names(args_A))
+idv <- args_A$id
+tv  <- args_A$time_name
+
+##------------------------
+## 1) 取主分析数据（保持结构一致）
+##------------------------
+rcvd_lat1 <- data.table::copy(as.data.table(args_A$obs_data))
+
+## 兼容：ELSA 若用 raracem，则补 nation
+if (!"nation" %in% names(rcvd_lat1) && "raracem" %in% names(rcvd_lat1)) {
+  rcvd_lat1[, nation := raracem]
+}
+
+##------------------------
+## 2) 从第2个区间开始随访：剔除 t0==0，并把时间轴整体前移 1
+##------------------------
+rcvd_lat1 <- rcvd_lat1[get(tv) >= 1L]
+rcvd_lat1[, (tv) := get(tv) - 1L]
+
+##------------------------
+## 3) 在新数据上重算滞后变量（时间轴变了必须重算），并给首期填充避免 NA
+##------------------------
+data.table::setorderv(rcvd_lat1, c(idv, tv))
+
+rcvd_lat1[, lag1_depression := data.table::shift(depression, 1L, type = "lag"), by = idv]
+rcvd_lat1[, lag1_smoken     := data.table::shift(smoken,     1L, type = "lag"), by = idv]
+
+rcvd_lat1[is.na(lag1_depression), lag1_depression := depression]
+rcvd_lat1[is.na(lag1_smoken),     lag1_smoken     := smoken]
+
+##------------------------
+## 4) 重算 time_points
+##------------------------
+time_points_lat1 <- max(rcvd_lat1[[tv]], na.rm = TRUE) + 1L
+
+##------------------------
+## 5) 复制主分析参数：替换 obs_data、time_points，并同步干预长度（关键）
+##------------------------
+args_lat1 <- args_A
+args_lat1$obs_data    <- rcvd_lat1
+args_lat1$time_points <- time_points_lat1
+
+## 干预函数必须与新的 time_points 对齐：重新 wrap_time
+wrap_time <- function(ints, time_points) {
+  lapply(ints, function(L) {
+    lapply(L, function(f) rep(list(f), time_points))
+  })
+}
+
+## 从主分析 args_A 里还原“未展开”的干预函数列表，再重新展开
+## （args_A$interventions 已经是展开后的；这里根据你的主分析命名直接重建）
+intervention_feasible_overall <- function(newdf, pool, intvar, intvals, time_name, t) {
+  data.table::setDT(newdf)
+  newdf[ runif(.N) < 0.5 & get(intvar) == 1L, (intvar) := 0L ]
+  newdf
+}
+intervention_intensified_overall <- function(newdf, pool, intvar, intvals, time_name, t) {
+  data.table::setDT(newdf)
+  newdf[ get(intvar) == 1L, (intvar) := 0L ]
+  newdf
+}
+
+ints_lat1 <- list(
+  int1_overall_50  = list(intervention_feasible_overall),
+  int2_overall_100 = list(intervention_intensified_overall)
+)
+
+args_lat1$interventions <- wrap_time(ints_lat1, time_points_lat1)
+
+##------------------------
+## 6) 跑 gformula
+##------------------------
+set.seed(20260115)
+gform_lat1 <- do.call(gformula, args_lat1)
+
+summary(gform_lat1)
+
+
+
+##==============================================================
+## 敏感性分析：同一波次内变量生成顺序（多方案对比）
+## ① 仅改顺序（不加同波次依赖）
+## ② 改顺序 + 同波次依赖（让顺序真的影响模拟）
+##
+## 前提：args_A、ints_A、wrap_time() 已存在
+##==============================================================
+
+library(data.table)
+library(dplyr)
+library(gfoRmula)
+
+##------------------------
+## 0) 基础检查 + 取主分析数据
+##------------------------
+stopifnot(exists("args_A"), is.list(args_A), "obs_data" %in% names(args_A))
+stopifnot(exists("ints_A"), exists("wrap_time"))
+
+idv <- args_A$id
+tv  <- args_A$time_name
+
+rcvd_ord <- data.table::copy(as.data.table(args_A$obs_data))
+data.table::setDT(rcvd_ord)
+
+## 保险：若 nation 不存在但 raracem 存在，则补 nation
+if (!"nation" %in% names(rcvd_ord) && "raracem" %in% names(rcvd_ord)) {
+  rcvd_ord[, nation := raracem]
+}
+
+##------------------------
+## 0.1) 推荐：补齐 lag1_*（避免模型里 lag1_ 拟合/预测时首期 NA 报错）
+## 只对“当前数据里确实存在”的变量补 lag
+##------------------------
+data.table::setorderv(rcvd_ord, c(idv, tv))
+
+vars_need_lag <- c("depression","smoken","drinkl","exercise","active")
+vars_need_lag <- intersect(vars_need_lag, names(rcvd_ord))
+
+for (v in vars_need_lag) {
+  lagv <- paste0("lag1_", v)
+  rcvd_ord[, (lagv) := data.table::shift(get(v), 1L, type = "lag"), by = idv]
+  rcvd_ord[is.na(get(lagv)), (lagv) := get(v)]
+}
+
+##------------------------
+## 1) 从主分析 args_A 自动构造 type_map / base_model_map（最稳）
+##------------------------
+type_map <- setNames(args_A$covtypes, args_A$covnames)
+
+## 把 covmodels（公式向量）转成“按左侧变量名命名”的 map
+base_covmodels <- args_A$covparams$covmodels
+lhs_name <- function(f) trimws(deparse(f[[2]]))
+base_model_map <- setNames(as.list(base_covmodels), vapply(base_covmodels, lhs_name, character(1)))
+
+## 主分析 covnames（你现在的主分析变量集合）
+main_covs <- args_A$covnames
+
+##------------------------
+## 2) 工具：构造 args（保证 covnames/covtypes/histvars/covmodels 顺序一致）
+##------------------------
+make_args_with_order <- function(order_vec, covmodel_map) {
+  stopifnot(all(order_vec %in% names(type_map)))
+  stopifnot(all(order_vec %in% names(covmodel_map)))
+
+  out <- args_A
+  out$obs_data  <- rcvd_ord
+  out$covnames  <- order_vec
+  out$covtypes  <- unname(type_map[order_vec])
+  out$histories <- list(lagged)
+  out$histvars  <- list(order_vec)
+  out$covparams <- list(covmodels = unname(covmodel_map[order_vec]))
+  out
+}
+
+##==============================================================
+## Part ①：仅改顺序（不加同波次依赖）
+##==============================================================
+
+## 你注释里的 4 变量版本：
+##   主分析顺序："exercise","smoken","drinkl","depression"
+##   A: "exercise","depression","smoken","drinkl"
+##   B: "smoken","drinkl","exercise","depression"
+##   C: "depression","smoken","drinkl","exercise"
+
+## 若主分析里有 active，则也给出 5 变量版本（你之前那套）
+has_active <- ("active" %in% main_covs) && ("active" %in% names(rcvd_ord))
+
+if (!has_active) {
+  order_main <- c("exercise","smoken","drinkl","depression")
+  order_A    <- c("exercise","depression","smoken","drinkl")
+  order_B    <- c("smoken","drinkl","exercise","depression")
+  order_C    <- c("depression","smoken","drinkl","exercise")
+} else {
+  ## 5变量版本（如果你把 active 加回主分析就会走这里）
+  order_main <- c("exercise","active","smoken","drinkl","depression")
+  order_A    <- c("exercise","active","depression","smoken","drinkl")
+  order_B    <- c("smoken","drinkl","exercise","active","depression")
+  order_C    <- c("depression","smoken","drinkl","exercise","active")
+}
+
+## 确保这些顺序都在“主分析协变量集合”中
+order_main <- intersect(order_main, main_covs)
+order_A    <- intersect(order_A,    main_covs)
+order_B    <- intersect(order_B,    main_covs)
+order_C    <- intersect(order_C,    main_covs)
+
+cat("\n================ 顺序敏感性①：仅改顺序（不加同波次依赖） ================\n")
+cat("main_covs =", paste(main_covs, collapse = ", "), "\n")
+cat("order_A   =", paste(order_A, collapse = " -> "), "\n")
+cat("order_B   =", paste(order_B, collapse = " -> "), "\n")
+cat("order_C   =", paste(order_C, collapse = " -> "), "\n")
+
+## 跑 A/B/C
+set.seed(20260115)
+gform_A_order <- do.call(gformula, make_args_with_order(order_A, base_model_map))
+cat("\n================ ①-A：仅改顺序 ================\n")
+print(summary(gform_A_order))
+
+set.seed(20260115)
+gform_B_order <- do.call(gformula, make_args_with_order(order_B, base_model_map))
+cat("\n================ ①-B：仅改顺序 ================\n")
+print(summary(gform_B_order))
+
+set.seed(20260115)
+gform_C_order <- do.call(gformula, make_args_with_order(order_C, base_model_map))
+cat("\n================ ①-C：仅改顺序 ================\n")
+print(summary(gform_C_order))
+
+
+##==============================================================
+## Part ②：改顺序 + 同波次依赖（让顺序真的影响模拟）
+## 核心：对每个顺序，令第 j 个变量的 covmodel 在原模型基础上
+##       额外加入“当期已生成的前 j-1 个变量”作为预测因子
+##==============================================================
+
+## 工具：在原公式 RHS 上追加 predictors（去重，且不追加自身）
+add_preds_to_formula <- function(fml, preds) {
+  y <- trimws(deparse(fml[[2]]))
+  preds <- setdiff(unique(preds), y)
+  if (length(preds) == 0) return(fml)
+  add_txt <- paste(preds, collapse = " + ")
+  as.formula(paste(deparse(fml), "+", add_txt))
+}
+
+## 根据顺序构造“同波次依赖”版 covmodel_map
+make_samewave_model_map <- function(order_vec, base_map) {
+  out <- base_map
+  for (j in seq_along(order_vec)) {
+    v <- order_vec[j]
+    preds <- order_vec[1:(j-1)]
+    out[[v]] <- add_preds_to_formula(base_map[[v]], preds)
+  }
+  out
+}
+
+## 这里按你的注释（如果你当前无 active，就是 4 变量 a/b/c；如果有 active，就是 5 变量 a/b/c）
+if (!has_active) {
+  ## 4变量版本（对应你第一段注释的 A/B/C 的同波次依赖版）
+  order_a <- c("exercise","depression","smoken","drinkl")
+  order_b <- c("smoken","drinkl","exercise","depression")
+  order_c <- c("depression","smoken","drinkl","exercise")
+} else {
+  ## 5变量版本（对应你第二段注释的 a/b/c）
+  order_a <- c("exercise","active","depression","smoken","drinkl")
+  order_b <- c("smoken","drinkl","exercise","active","depression")
+  order_c <- c("depression","smoken","drinkl","exercise","active")
+}
+
+order_a <- intersect(order_a, main_covs)
+order_b <- intersect(order_b, main_covs)
+order_c <- intersect(order_c, main_covs)
+
+covmodels_a <- make_samewave_model_map(order_a, base_model_map)
+covmodels_b <- make_samewave_model_map(order_b, base_model_map)
+covmodels_c <- make_samewave_model_map(order_c, base_model_map)
+
+cat("\n================ 顺序敏感性②：改顺序 + 同波次依赖 ================\n")
+cat("order_a =", paste(order_a, collapse = " -> "), "\n")
+cat("order_b =", paste(order_b, collapse = " -> "), "\n")
+cat("order_c =", paste(order_c, collapse = " -> "), "\n")
+
+set.seed(20260116)
+gform_a_samewave <- do.call(gformula, make_args_with_order(order_a, covmodels_a))
+cat("\n================ ②-a：同波次依赖 ================\n")
+print(summary(gform_a_samewave))
+
+set.seed(20260116)
+gform_b_samewave <- do.call(gformula, make_args_with_order(order_b, covmodels_b))
+cat("\n================ ②-b：同波次依赖 ================\n")
+print(summary(gform_b_samewave))
+
+set.seed(20260116)
+gform_c_samewave <- do.call(gformula, make_args_with_order(order_c, covmodels_c))
+cat("\n================ ②-c：同波次依赖 ================\n")
+print(summary(gform_c_samewave))
+
+
+
+##==============================================================
+## 敏感性分析：暴露不同定义（ELSA）
+## CESD 阈值：主分析 cut=3；敏感性 cut=4 / 5
+##==============================================================
+
+run_gformula_dep_cut_elsa <- function(dep_cut, args_template) {
+
+  ##------------------------
+  ## 0) 基础检查 + 复制数据（不污染原始）
+  ##------------------------
+  stopifnot(is.list(args_template), "obs_data" %in% names(args_template))
+  dat <- data.table::copy(as.data.table(args_template$obs_data))
+
+  idv <- args_template$id
+  tv  <- args_template$time_name
+
+  ##------------------------
+  ## 1) 兼容：ELSA 若用 raracem，则补 nation
+  ##------------------------
+  if (!"nation" %in% names(dat) && "raracem" %in% names(dat)) {
+    dat[, nation := raracem]
+  }
+
+  ##------------------------
+  ## 2) 覆盖重算 depression（ELSA: cesd）
+  ##------------------------
+  if (!"cesd" %in% names(dat)) stop("数据中找不到 cesd 列（ELSA CES-D），请检查变量名。")
+  dat[, depression := as.integer(cesd >= dep_cut)]
+
+  ##------------------------
+  ## 3) 同步重算 lag1_depression（以及 lag1_smoken，保证一致）
+  ##    并对每人首期用自身值填充，避免 NA 影响拟合/预测
+  ##------------------------
+  data.table::setorderv(dat, c(idv, tv))
+
+  dat[, lag1_depression := data.table::shift(depression, 1L, type = "lag"), by = idv]
+  dat[, lag1_smoken     := data.table::shift(smoken,     1L, type = "lag"), by = idv]
+
+  dat[is.na(lag1_depression), lag1_depression := depression]
+  dat[is.na(lag1_smoken),     lag1_smoken     := smoken]
+
+  ##------------------------
+  ## 4) 组装参数并运行（干预与协变量模型等保持主分析一致）
+  ##------------------------
+  args_now <- args_template
+  args_now$obs_data <- dat
+
+  fit <- do.call(gformula, args_now)
+  list(dep_cut = dep_cut, fit = fit)
+}
+
+##—— 分别跑 cut= 4 / 5——
+
+set.seed(20260115)
+res_cut4 <- run_gformula_dep_cut_elsa(4, args_A)
+
+set.seed(20260115)
+res_cut5 <- run_gformula_dep_cut_elsa(5, args_A)
+
+##—— 查看结果 —— 
+cat("\n================ cut = 4 ================\n")
+print(summary(res_cut4$fit))
+
+cat("\n================ cut = 5 ================\n")
+print(summary(res_cut5$fit))
+
+
+
+
+################################################################################
+## 敏感性分析：MI + gfoRmula + Rubin pooling（ELSA）
+## ——严格对齐你当前主分析（4个协变量 + basecovs含 raeduc_c）
+## covnames = exercise, smoken, drinkl, depression
+## basecovs = ragender, nation, raeduc_c, age_group
+## outcome  = CVD_surv（cummax版本：与你主分析一致）
+##
+## 前提：rcvd_base / args_A / ints_A / wrap_time() 已存在
+################################################################################
+
+library(dplyr)
+library(data.table)
+library(mice)
+library(gfoRmula)
+
+stopifnot(exists("rcvd_base"), exists("args_A"), exists("ints_A"), exists("wrap_time"))
+
+##==============================================================
+## 0) 小工具：0/1 或 1/2 -> 0/1
+##==============================================================
+recode01_smart <- function(x) {
+  x0 <- suppressWarnings(as.numeric(x))
+  ux <- sort(unique(x0[is.finite(x0)]))
+  if (length(ux) == 0) return(as.integer(rep(NA, length(x0))))
+  if (all(ux %in% c(0, 1))) return(as.integer(x0))
+  if (all(ux %in% c(1, 2))) return(as.integer(ifelse(x0 == 1, 1L, ifelse(x0 == 2, 0L, NA_integer_))))
+  as.integer(ifelse(x0 %in% c(0, 1), x0, NA_integer_))
+}
+
+## 教育 raeduc_c：按你主分析规则映射为 0/1（1->0；2/3->1）
+recode_educ_elsa01 <- function(x) {
+  x0 <- suppressWarnings(as.numeric(x))
+  ux <- sort(unique(x0[is.finite(x0)]))
+  if (length(ux) == 0) return(as.integer(rep(NA, length(x0))))
+  if (all(ux %in% c(0, 1))) return(as.integer(x0))
+  out <- rep(NA_integer_, length(x0))
+  out[x0 %in% c(1)]    <- 0L
+  out[x0 %in% c(2, 3)] <- 1L
+  out
+}
+
+##==============================================================
+## 1) MI-1：准备 long（gap或key缺失=>截断；不插补缺波/结局缺失）
+##   key：CVD / cesd（与你 Part1 一致）
+##==============================================================
+prep_long_for_mi_elsa <- function(rcvd_base, need_waves = 4:9) {
+
+  df0 <- rcvd_base
+
+  ## drink 变量名兜底：统一成 drinkl
+  if (!("drinkl" %in% names(df0)) && ("drinkl" %in% names(df0))) {
+    df0 <- df0 %>% rename(drinkl = drinkl)
+  }
+
+  need_raw <- c("ID","wave","CVD","cesd","agey","ragender","raracem","raeduc_c",
+                "smoken","drinkl","ltactx_e","mdactx_e","vgactx_e")
+  miss_raw <- setdiff(need_raw, names(df0))
+  if (length(miss_raw) > 0) stop(paste0("rcvd_base 缺少列：", paste(miss_raw, collapse = ", ")))
+
+  df <- df0 %>%
+    mutate(
+      wave = as.integer(wave),
+      cesd = suppressWarnings(as.numeric(cesd)),
+      agey = suppressWarnings(as.numeric(agey)),
+      CVD  = suppressWarnings(as.integer(as.numeric(CVD))),
+
+      ragender = recode01_smart(ragender),
+      raracem  = recode01_smart(raracem),
+      smoken   = recode01_smart(smoken),
+      drinkl   = recode01_smart(drinkl),
+
+      raeduc_c = recode_educ_elsa01(raeduc_c),
+
+      ## 体力活动频率：只保留 2/3/4/5，其他置 NA 给 MI
+      ltactx_e = suppressWarnings(as.integer(as.numeric(ltactx_e))),
+      mdactx_e = suppressWarnings(as.integer(as.numeric(mdactx_e))),
+      vgactx_e = suppressWarnings(as.integer(as.numeric(vgactx_e))),
+      ltactx_e = if_else(ltactx_e %in% c(2L,3L,4L,5L), ltactx_e, NA_integer_),
+      mdactx_e = if_else(mdactx_e %in% c(2L,3L,4L,5L), mdactx_e, NA_integer_),
+      vgactx_e = if_else(vgactx_e %in% c(2L,3L,4L,5L), vgactx_e, NA_integer_)
+    ) %>%
+    filter(wave %in% need_waves) %>%
+    arrange(ID, wave) %>%
+    group_by(ID) %>%
+    mutate(
+      wave_expect  = first(wave) + row_number() - 1L,
+      gap_row      = (wave != wave_expect),
+      miss_key_row = is.na(CVD) | is.na(cesd),
+      stop_row     = gap_row | miss_key_row,
+      after_stop   = cumsum(stop_row) > 0
+    ) %>%
+    filter(!after_stop) %>%
+    mutate(t0 = row_number() - 1L) %>%
+    ungroup() %>%
+    select(-wave_expect, -gap_row, -miss_key_row, -stop_row, -after_stop)
+
+  ## 至少2条记录
+  ids_keep <- df %>% count(ID, name = "nwave") %>% filter(nwave >= 2) %>% pull(ID)
+  df %>% filter(ID %in% ids_keep)
+}
+
+##==============================================================
+## 2) MI-2：mice 插补（不插补 ID/wave/t0/CVD）
+##   连续：cesd, agey -> pmm
+##   二元：ragender, raracem, raeduc_c, smoken, drinkl -> logreg
+##   多分类：lt/md/vg (2-5) -> polyreg
+##==============================================================
+run_mice_fcs_elsa <- function(df_long, m = 10, maxit = 10, seed = 20260116) {
+
+  imp_cont <- c("cesd","agey")
+  imp_bin  <- c("ragender","raracem","raeduc_c","smoken","drinkl")
+  imp_cat  <- c("ltactx_e","mdactx_e","vgactx_e")
+
+  keep_vars <- c("ID","wave","t0","CVD", imp_cont, imp_bin, imp_cat)
+
+  dat <- df_long %>%
+    select(all_of(keep_vars)) %>%
+    mutate(
+      across(all_of(imp_cont), ~ as.numeric(.x)),
+      across(all_of(imp_bin),  ~ as.integer(.x)),
+      across(all_of(imp_cat),  ~ factor(.x, levels = c(2,3,4,5)))
+    )
+
+  ini  <- mice(dat, maxit = 0, printFlag = FALSE)
+  meth <- ini$method
+  pred <- ini$predictorMatrix
+
+  ## 不插补
+  meth[c("ID","wave","t0","CVD")] <- ""
+
+  ## 方法
+  meth[imp_cont] <- "pmm"
+  meth[imp_bin]  <- "logreg"
+  meth[imp_cat]  <- "polyreg"
+
+  ## predictorMatrix：不让别人用 ID
+  pred[, "ID"] <- 0
+  ## wave/t0/CVD 可作预测因子
+  pred[, c("wave","t0","CVD")] <- 1
+  pred[c("ID","wave","t0","CVD"), ] <- 0
+
+  set.seed(seed)
+  mice(dat, m = m, method = meth, predictorMatrix = pred,
+       maxit = maxit, seed = seed, printFlag = TRUE)
+}
+
+##==============================================================
+## 3) MI-3：派生主分析变量 + cummax 构造 CVD_surv（与你主分析一致）
+##   depression = (cesd >= 3)
+##   exercise：lt/md/vg 任一为 2/3/4 =>1；否则(=5) =>0
+##   nation = raracem
+##   age_group：按 agey 切分并冻结基线；再转 0/1（>60=1）
+##   raeduc_c：冻结基线（0/1）
+##==============================================================
+prep_analysis_for_gformula_elsa <- function(df_long_complete, dep_cut = 3) {
+
+  df0 <- df_long_complete
+  if (!("drinkl" %in% names(df0)) && ("drinkl" %in% names(df0))) {
+    df0 <- df0 %>% rename(drinkl = drinkl)
+  }
+
+  df <- df0 %>%
+    arrange(ID, wave) %>%
+    mutate(
+      ltactx_e = suppressWarnings(as.integer(as.character(ltactx_e))),
+      mdactx_e = suppressWarnings(as.integer(as.character(mdactx_e))),
+      vgactx_e = suppressWarnings(as.integer(as.character(vgactx_e))),
+
+      depression = as.integer(as.numeric(cesd) >= dep_cut),
+      nation     = as.integer(raracem),
+
+      age_group = cut(as.numeric(agey),
+                      breaks = c(50, 60, Inf),
+                      right  = FALSE,
+                      labels = c("50-59years",">60years")),
+
+      lt_bin = if_else(ltactx_e %in% c(2L,3L,4L), 1L, 0L),
+      md_bin = if_else(mdactx_e %in% c(2L,3L,4L), 1L, 0L),
+      vg_bin = if_else(vgactx_e %in% c(2L,3L,4L), 1L, 0L),
+      exercise = as.integer((lt_bin + md_bin + vg_bin) > 0),
+
+      smoken   = as.integer(smoken),
+      drinkl   = as.integer(drinkl),
+      ragender = as.integer(ragender),
+      raeduc_c = as.integer(raeduc_c),
+      CVD      = as.integer(CVD)
+    ) %>%
+    select(-lt_bin, -md_bin, -vg_bin)
+
+  ## 冻结 basecovs 为基线值（t0==0）
+  df <- df %>%
+    arrange(ID, t0) %>%
+    group_by(ID) %>%
+    mutate(
+      ragender  = first(ragender),
+      nation    = first(nation),
+      raeduc_c  = first(raeduc_c),
+      age_group = first(age_group)
+    ) %>%
+    ungroup() %>%
+    mutate(age_group = as.integer(as.character(age_group) %in% c(">60years","1")))
+
+  ## 补齐 lag1（避免模型里引用 lag1_ 报错）
+  df <- df %>%
+    arrange(ID, t0) %>%
+    group_by(ID) %>%
+    mutate(
+      lag1_depression = dplyr::lag(depression, default = first(depression)),
+      lag1_smoken     = dplyr::lag(smoken,     default = first(smoken))
+    ) %>%
+    ungroup()
+
+  ## 必需列不得 NA（按 ID 剔除）
+  must <- c("t0","CVD","CVD_surv_dummy") # 占位，下面再算 CVD_surv
+  chk_cols <- c("t0","ragender","nation","raeduc_c","age_group","exercise","smoken","drinkl","depression","CVD")
+  bad_ids <- df %>%
+    group_by(ID) %>%
+    summarise(any_bad = any(rowSums(is.na(across(all_of(chk_cols)))) > 0), .groups="drop") %>%
+    filter(any_bad) %>% pull(ID)
+  if (length(bad_ids) > 0) df <- df %>% filter(!ID %in% bad_ids)
+  if (nrow(df) == 0) return(df)
+
+  ## cummax 版本构造 CVD_surv + post_event 删除（与你主分析一致）
+  df_surv <- df %>%
+    group_by(ID) %>%
+    arrange(t0, .by_group = TRUE) %>%
+    mutate(
+      CVD_cum  = cummax(CVD),
+      CVD_surv = as.integer(CVD_cum == 1L & lag(CVD_cum, default = 0L) == 0L),
+      post_event = (cummax(CVD_surv) == 1L & CVD_surv == 0L)
+    ) %>%
+    filter(!post_event) %>%
+    ungroup() %>%
+    select(-CVD_cum, -post_event)
+
+  df_surv
+}
+
+##==============================================================
+## 4) 末时点提取（稳健版）
+##==============================================================
+extract_end_from_gform_fixed <- function(gobj) {
+  res0 <- NULL
+  if (!is.null(gobj$result))  res0 <- gobj$result
+  if (is.null(res0) && !is.null(gobj$results)) res0 <- gobj$results
+  if (is.null(res0)) stop("gformula 对象里找不到 result / results")
+
+  res <- as.data.frame(res0, check.names = FALSE)
+
+  pick1 <- function(pattern) {
+    hit <- grep(pattern, names(res), value = TRUE, ignore.case = TRUE)
+    if (length(hit) == 0) return(NA_character_)
+    hit[1]
+  }
+
+  kcol <- pick1("^k$")
+  icol <- pick1("^interv\\.?$|^interv$|^intervention$")
+
+  risk_col   <- pick1("^g[- ]?form risk$|^gform risk$")
+  riskse_col <- pick1("^risk se$")
+  riskl_col  <- pick1("^risk lower")
+  risku_col  <- pick1("^risk upper")
+
+  rr_col     <- pick1("^risk ratio$|^rr$")
+  rrse_col   <- pick1("^rr se$")
+  rrl_col    <- pick1("^rr lower")
+  rru_col    <- pick1("^rr upper")
+
+  rd_col     <- pick1("^risk difference$|^risk diff|^rd$")
+  rdse_col   <- pick1("^rd se$")
+  rdl_col    <- pick1("^rd lower")
+  rdu_col    <- pick1("^rd upper")
+
+  if (anyNA(c(kcol, icol, risk_col, rd_col, rr_col))) {
+    stop(paste0("提取失败：缺关键列。现有列名：", paste(names(res), collapse = ", ")))
+  }
+
+  endk <- max(res[[kcol]], na.rm = TRUE)
+  re   <- res[res[[kcol]] == endk, , drop = FALSE]
+
+  getnum <- function(col) {
+    if (is.na(col) || !col %in% names(re)) return(rep(NA_real_, nrow(re)))
+    suppressWarnings(as.numeric(re[[col]]))
+  }
+
+  interv <- suppressWarnings(as.integer(as.character(re[[icol]])))
+
+  risk    <- getnum(risk_col)
+  risk_se <- getnum(riskse_col)
+  risk_l  <- getnum(riskl_col)
+  risk_u  <- getnum(risku_col)
+  risk_se <- ifelse(is.na(risk_se) & is.finite(risk_l) & is.finite(risk_u),
+                    (risk_u - risk_l) / (2 * 1.96), risk_se)
+
+  rd    <- getnum(rd_col)
+  rd_se <- getnum(rdse_col)
+  rd_l  <- getnum(rdl_col)
+  rd_u  <- getnum(rdu_col)
+  rd_se <- ifelse(is.na(rd_se) & is.finite(rd_l) & is.finite(rd_u),
+                  (rd_u - rd_l) / (2 * 1.96), rd_se)
+
+  rr    <- getnum(rr_col)
+  rr_se <- getnum(rrse_col)
+  rr_l  <- getnum(rrl_col)
+  rr_u  <- getnum(rru_col)
+  rr_se <- ifelse(is.na(rr_se) & is.finite(rr_l) & is.finite(rr_u) & is.finite(rr) & rr > 0,
+                  rr * (log(rr_u) - log(rr_l)) / (2 * 1.96), rr_se)
+
+  data.frame(
+    interv     = interv,
+    gform_risk = risk,
+    risk_se    = risk_se,
+    rd         = rd,
+    rd_se      = rd_se,
+    rr         = rr,
+    rr_se      = rr_se
+  )
+}
+
+##==============================================================
+## 5) Rubin pooling（risk/RD 直接 pool；RR 在 log 尺度 pool）
+##==============================================================
+rubin_pool2 <- function(q, se) {
+  ok <- is.finite(q) & is.finite(se)
+  q <- q[ok]; se <- se[ok]
+  m <- length(q)
+  if (m < 2) return(list(est = mean(q), se = NA_real_, lcl = NA_real_, ucl = NA_real_))
+  u <- se^2
+  qbar <- mean(q)
+  ubar <- mean(u)
+  b <- stats::var(q)
+  tvar <- ubar + (1 + 1/m) * b
+  se_pool <- sqrt(tvar)
+  ci <- qbar + c(-1, 1) * 1.96 * se_pool
+  list(est = qbar, se = se_pool, lcl = ci[1], ucl = ci[2])
+}
+
+################################################################################
+## 6) 运行：MI -> 每个插补跑 gformula -> 提取末时点 -> Rubin pooling
+################################################################################
+
+## (1) 准备 MI long
+rcvd_mi0 <- prep_long_for_mi_elsa(rcvd_base, need_waves = 4:9)
+
+cat("\n[MI] prep_long 完成：ID数 =", n_distinct(rcvd_mi0$ID), "；行数 =", nrow(rcvd_mi0), "\n")
+
+## (2) mice
+imp <- run_mice_fcs_elsa(rcvd_mi0, m = 10, maxit = 10, seed = 20260116)
+
+## (3) 每个插补跑 gformula 并提取末时点
+m <- imp$m
+end_list <- vector("list", m)
+fail_log <- character(0)
+
+for (i in 1:m) {
+
+  dat_i_long <- mice::complete(imp, action = i)
+
+  dat_i_surv <- tryCatch(
+    prep_analysis_for_gformula_elsa(dat_i_long, dep_cut = 3),
+    error = function(e) {
+      fail_log <<- c(fail_log, paste0("prep failed | imp=", i, " : ", e$message))
+      NULL
+    }
+  )
+  if (is.null(dat_i_surv) || nrow(dat_i_surv) == 0) {
+    end_list[[i]] <- NULL
+    next
+  }
+
+  data.table::setDT(dat_i_surv)
+
+  args_i <- args_A
+  args_i$obs_data    <- dat_i_surv
+  args_i$time_points <- max(dat_i_surv[[args_i$time_name]], na.rm = TRUE) + 1L
+  args_i$interventions <- wrap_time(ints_A, args_i$time_points)
+
+  ## 区分 seed
+  args_i$seed <- 4321 + i
+
+  ## nsimul 至少>=样本数（避免MC太小导致不稳定/报错风险）
+  nsubj <- length(unique(dat_i_surv[[args_i$id]]))
+  args_i$nsimul <- max(args_i$nsimul, nsubj)
+
+  gform_i <- tryCatch(
+    do.call(gformula, args_i),
+    error = function(e) {
+      fail_log <<- c(fail_log, paste0("gformula failed | imp=", i, " : ", e$message))
+      NULL
+    }
+  )
+
+  if (!is.null(gform_i)) {
+    end_list[[i]] <- tryCatch(
+      dplyr::mutate(extract_end_from_gform_fixed(gform_i), .imp = i),
+      error = function(e) {
+        fail_log <<- c(fail_log, paste0("extract failed | imp=", i, " : ", e$message))
+        NULL
+      }
+    )
+  } else {
+    end_list[[i]] <- NULL
+  }
+}
+
+if (length(fail_log) > 0) {
+  cat("\n---- fail_log（前 30 条）----\n")
+  print(head(fail_log, 30))
+}
+
+end_list_ok <- Filter(function(x) !is.null(x) && is.data.frame(x) && nrow(x) > 0, end_list)
+end_all <- dplyr::bind_rows(end_list_ok)
+if (nrow(end_all) == 0) stop("end_all 是空表：所有插补都提取失败。请先看 fail_log。")
+
+cat("\n--- 每个干预(interv)成功提取次数 ---\n")
+print(table(end_all$interv, useNA = "ifany"))
+
+end_all <- end_all %>%
+  mutate(
+    interv     = as.integer(interv),
+    gform_risk = as.numeric(gform_risk),
+    risk_se    = as.numeric(risk_se),
+    rd         = as.numeric(rd),
+    rd_se      = as.numeric(rd_se),
+    rr         = as.numeric(rr),
+    rr_se      = as.numeric(rr_se)
+  )
+
+mi_pooled <- end_all %>%
+  group_by(interv) %>%
+  group_modify(~{
+    dat <- .x
+    prisk <- rubin_pool2(dat$gform_risk, dat$risk_se)
+    prd   <- rubin_pool2(dat$rd, dat$rd_se)
+
+    se_log <- dat$rr_se / dat$rr
+    prrlog <- rubin_pool2(log(dat$rr), se_log)
+
+    tibble(
+      risk_est = prisk$est, risk_se = prisk$se, risk_lcl = prisk$lcl, risk_ucl = prisk$ucl,
+      rd_est   = prd$est,   rd_se   = prd$se,   rd_lcl   = prd$lcl,   rd_ucl   = prd$ucl,
+      rr_est   = exp(prrlog$est), rr_lcl = exp(prrlog$lcl), rr_ucl = exp(prrlog$ucl)
+    )
+  }) %>%
+  ungroup() %>%
+  arrange(interv)
+
+cat("\n================ MI pooled (ELSA, aligned to main) ================\n")
+print(mi_pooled)
+
+
+################################################################################
+## Complete-case（不做LOCF/不做MI）——对齐你当前主分析（含 raeduc_c）
+## 逻辑：
+##  ① gap/key缺失先截断（key=CVD/cesd）
+##  ② 协变量缺失 => 首次缺失波次行政性截尾（不保留该波次及之后）
+##  ③ 按主分析派生变量，并用 cummax 构造 CVD_surv + post_event 删除
+################################################################################
+
+library(dplyr)
+library(data.table)
+library(gfoRmula)
+
+make_cc_obs_elsa <- function(rcvd_base, need_waves = 4:9, dep_cut = 3) {
+
+  ##----------------------------
+  ## 0) 内置小工具：保证自包含
+  ##----------------------------
+  recode01_smart <- function(x) {
+    x0 <- suppressWarnings(as.numeric(x))
+    ux <- sort(unique(x0[is.finite(x0)]))
+    if (length(ux) == 0) return(as.integer(rep(NA, length(x0))))
+    if (all(ux %in% c(0, 1))) return(as.integer(x0))
+    if (all(ux %in% c(1, 2))) return(as.integer(ifelse(x0 == 1, 1L, ifelse(x0 == 2, 0L, NA_integer_))))
+    as.integer(ifelse(x0 %in% c(0, 1), x0, NA_integer_))
+  }
+
+  recode_educ_elsa01 <- function(x) {
+    x0 <- suppressWarnings(as.numeric(x))
+    ux <- sort(unique(x0[is.finite(x0)]))
+    if (length(ux) == 0) return(as.integer(rep(NA, length(x0))))
+    if (all(ux %in% c(0, 1))) return(as.integer(x0))
+    out <- rep(NA_integer_, length(x0))
+    out[x0 %in% c(1)]    <- 0L
+    out[x0 %in% c(2, 3)] <- 1L
+    out
+  }
+
+  ##----------------------------
+  ## 1) 变量名兜底：drink 统一输出为 drinkl（匹配你 args_A）
+  ##----------------------------
+  df0 <- rcvd_base
+  drink_raw <- dplyr::case_when(
+    "drinkl" %in% names(df0) ~ "drinkl",
+    "drinkl" %in% names(df0) ~ "drinkl",
+    TRUE ~ NA_character_
+  )
+  if (is.na(drink_raw)) stop("rcvd_base 里找不到 drinkl/drinkl（饮酒变量），请检查你 rename 的拼写。")
+
+  need_raw <- c("ID","wave","CVD","cesd","agey","ragender","raracem","raeduc_c",
+                "smoken", drink_raw, "ltactx_e","mdactx_e","vgactx_e")
+  miss_raw <- setdiff(need_raw, names(df0))
+  if (length(miss_raw) > 0) stop(paste0("rcvd_base 缺少列：", paste(miss_raw, collapse = ", ")))
+
+  ##----------------------------
+  ## 2) gap/key缺失 => 截断（与你 Part1 一致）
+  ##----------------------------
+  df <- df0 %>%
+    mutate(
+      wave = as.integer(wave),
+      cesd = suppressWarnings(as.numeric(cesd)),
+      agey = suppressWarnings(as.numeric(agey)),
+      CVD  = suppressWarnings(as.integer(as.numeric(CVD))),
+
+      ragender = recode01_smart(ragender),
+      raracem  = recode01_smart(raracem),
+      smoken   = recode01_smart(smoken),
+
+      ## 统一输出列名：drinkl（匹配你主分析 covnames_A）
+      drinkl   = recode01_smart(.data[[drink_raw]]),
+
+      ## 教育先映射为 0/1（缺失保留）
+      raeduc_c = recode_educ_elsa01(raeduc_c),
+
+      ## 体力活动：保留 2/3/4/5；其他置 NA
+      ltactx_e = suppressWarnings(as.integer(as.numeric(ltactx_e))),
+      mdactx_e = suppressWarnings(as.integer(as.numeric(mdactx_e))),
+      vgactx_e = suppressWarnings(as.integer(as.numeric(vgactx_e))),
+      ltactx_e = if_else(ltactx_e %in% c(2L,3L,4L,5L), ltactx_e, NA_integer_),
+      mdactx_e = if_else(mdactx_e %in% c(2L,3L,4L,5L), mdactx_e, NA_integer_),
+      vgactx_e = if_else(vgactx_e %in% c(2L,3L,4L,5L), vgactx_e, NA_integer_)
+    ) %>%
+    filter(wave %in% need_waves) %>%
+    arrange(ID, wave) %>%
+    group_by(ID) %>%
+    mutate(
+      wave_expect  = first(wave) + row_number() - 1L,
+      gap_row      = (wave != wave_expect),
+      miss_key_row = is.na(CVD) | is.na(cesd),
+      stop_row     = gap_row | miss_key_row,
+      after_stop   = cumsum(stop_row) > 0
+    ) %>%
+    filter(!after_stop) %>%
+    mutate(t0 = row_number() - 1L) %>%
+    ungroup() %>%
+    select(-wave_expect, -gap_row, -miss_key_row, -stop_row, -after_stop)
+
+  ## 至少2条记录
+  df <- df %>% group_by(ID) %>% filter(n() >= 2) %>% ungroup()
+  if (nrow(df) == 0) return(df)
+
+  ##----------------------------
+  ## 3) 协变量缺失 => 行政性截尾（不保留首次缺失波次及之后）
+  ##   注意：这里 cov_raw 用的是你主分析里真正依赖的“原始协变量”
+  ##----------------------------
+  cov_raw <- c("smoken","drinkl","raeduc_c","ltactx_e","mdactx_e","vgactx_e")
+
+  df <- df %>%
+    arrange(ID, wave) %>%
+    group_by(ID) %>%
+    mutate(
+      row_miss_cov = if_any(all_of(cov_raw), is.na),
+      first_miss_wave = suppressWarnings(min(wave[row_miss_cov], na.rm = TRUE)),
+      first_miss_wave = ifelse(is.infinite(first_miss_wave), NA, first_miss_wave)
+    ) %>%
+    ungroup() %>%
+    filter(is.na(first_miss_wave) | wave < first_miss_wave) %>%
+    select(-row_miss_cov, -first_miss_wave)
+
+  df <- df %>% group_by(ID) %>% filter(n() >= 2) %>% ungroup()
+  if (nrow(df) == 0) return(df)
+
+  ##----------------------------
+  ## 4) 派生主分析变量（与你主分析一致）
+  ##----------------------------
+  df <- df %>%
+    mutate(
+      depression = as.integer(cesd >= dep_cut),
+      nation     = as.integer(raracem),
+
+      age_group = cut(agey,
+                      breaks = c(50, 60, Inf),
+                      right  = FALSE,
+                      labels = c("50-59years",">60years")),
+
+      lt_bin = if_else(ltactx_e %in% c(2L,3L,4L), 1L, 0L),
+      md_bin = if_else(mdactx_e %in% c(2L,3L,4L), 1L, 0L),
+      vg_bin = if_else(vgactx_e %in% c(2L,3L,4L), 1L, 0L),
+      exercise = as.integer((lt_bin + md_bin + vg_bin) > 0)
+    ) %>%
+    select(-lt_bin, -md_bin, -vg_bin)
+
+  ## 冻结 basecovs 为基线值（含 raeduc_c）
+  df <- df %>%
+    arrange(ID, t0) %>%
+    group_by(ID) %>%
+    mutate(
+      ragender  = first(ragender),
+      nation    = first(nation),
+      raeduc_c  = first(raeduc_c),
+      age_group = first(age_group)
+    ) %>%
+    ungroup() %>%
+    mutate(age_group = as.integer(as.character(age_group) %in% c(">60years","1")))
+
+  ## 补齐 lag1_*（你 ymodel/covmodel 用到了）
+  df <- df %>%
+    arrange(ID, t0) %>%
+    group_by(ID) %>%
+    mutate(
+      lag1_depression = dplyr::lag(depression, default = first(depression)),
+      lag1_smoken     = dplyr::lag(smoken,     default = first(smoken))
+    ) %>%
+    ungroup()
+
+  ##----------------------------
+  ## 5) 构造 CVD_surv（cummax + post_event 删除：与你主分析一致）
+  ##----------------------------
+  df <- df %>%
+    group_by(ID) %>%
+    arrange(t0, .by_group = TRUE) %>%
+    mutate(
+      CVD_cum   = cummax(CVD),
+      CVD_surv  = as.integer(CVD_cum == 1L & lag(CVD_cum, default = 0L) == 0L),
+      post_event = (cummax(CVD_surv) == 1L & CVD_surv == 0L)
+    ) %>%
+    filter(!post_event) %>%
+    ungroup() %>%
+    select(-CVD_cum, -post_event)
+
+  df
+}
+
+##--------------------------------------------------------------
+## 跑 CC：复用 args_A，只替换 obs_data/time_points/interventions
+##--------------------------------------------------------------
+stopifnot(exists("rcvd_base"), exists("args_A"), exists("ints_A"), exists("wrap_time"))
+
+rcvd_cc <- make_cc_obs_elsa(rcvd_base, need_waves = 4:9, dep_cut = 3)
+data.table::setDT(rcvd_cc)
+
+cat("\n================ CC 数据规模（aligned）================\n")
+cat("Complete-case IDs:", dplyr::n_distinct(rcvd_cc$ID),
+    " | rows:", nrow(rcvd_cc), "\n")
+
+if (nrow(rcvd_cc) == 0) {
+  cat("\n⚠️ CC 为空：协变量缺失导致行政截尾后无人保留≥2次连续访视。\n")
+} else {
+
+  args_CC <- args_A
+  args_CC$obs_data    <- rcvd_cc
+  args_CC$time_points <- max(rcvd_cc[[args_CC$time_name]], na.rm = TRUE) + 1L
+  args_CC$interventions <- wrap_time(ints_A, args_CC$time_points)
+
+  ## nsimul 保底（避免MC太小）
+  nsubj_cc <- length(unique(rcvd_cc[[args_CC$id]]))
+  args_CC$nsimul <- max(args_CC$nsimul, nsubj_cc)
+
+  set.seed(20260116)
+  gform_CC <- do.call(gformula, args_CC)
+
+  cat("\n================ Complete-case gformula ================\n")
+  print(summary(gform_CC))
+}
+
+
+
+
+##==============================================================
+## ELSA 敏感性分析：二次项
+## 基线 CESD（cesd）、基线年龄（agey） -> 中心化 + I(x^2)
+## 同时更新：ymodel + depression 的 covmodel
+## 关键：把 cesd0_c / age0_c 加入 basecovs（否则 gfoRmula 内部会丢列）
+## 严格沿用主分析 args_A 的 nsimul / nsamples
+##==============================================================
+
+library(data.table)
+library(dplyr)
+library(gfoRmula)
+
+##------------------------
+## 0) 取主分析用的数据（用 args_A$obs_data，确保结构一致）
+##------------------------
+stopifnot(exists("args_A"), is.list(args_A), "obs_data" %in% names(args_A))
+stopifnot(exists("ints_A"))
+stopifnot(exists("wrap_time"))
+
+dt <- data.table::copy(as.data.table(args_A$obs_data))
+data.table::setDT(dt)
+
+idv <- args_A$id
+tv  <- args_A$time_name
+
+## 兼容：若 nation 不存在但有 raracem，则补 nation
+if (!"nation" %in% names(dt) && "raracem" %in% names(dt)) {
+  dt[, nation := raracem]
+}
+
+## cesd / agey 列检查（若你数据里用的是别名，这里可自动兜底）
+cesd_col <- if ("cesd" %in% names(dt)) "cesd" else NA_character_
+age_col  <- if ("agey" %in% names(dt)) "agey" else if ("age" %in% names(dt)) "age" else NA_character_
+
+need_cols <- c(idv, tv, cesd_col, age_col)
+miss_cols <- need_cols[is.na(need_cols) | !need_cols %in% names(dt)]
+if (length(miss_cols) > 0) {
+  stop(paste0("obs_data 缺少列：", paste(miss_cols, collapse = ", ")))
+}
+
+##------------------------
+## 1) 生成“基线”CESD 和 年龄（每个ID最早时间点那行）
+##------------------------
+to_num_safe <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+dt[, cesd_num := to_num_safe(get(cesd_col))]
+dt[, age_num  := to_num_safe(get(age_col))]
+
+data.table::setorderv(dt, c(idv, tv))
+dt[, tmin := min(get(tv), na.rm = TRUE), by = idv]
+
+dt[, cesd0 := cesd_num[get(tv) == tmin][1], by = idv]
+dt[, age0  := age_num[get(tv) == tmin][1], by = idv]
+
+dt[, tmin := NULL]
+
+## 剔除基线缺失的ID
+bad_ids <- dt[is.na(cesd0) | is.na(age0), unique(get(idv))]
+if (length(bad_ids) > 0) {
+  message("剔除基线 cesd0/age0 缺失的ID数：", length(bad_ids))
+  dt <- dt[!get(idv) %in% bad_ids]
+}
+
+## 中心化（平方项用 I() 放到公式里）
+m_cesd0 <- dt[, mean(cesd0, na.rm = TRUE)]
+m_age0  <- dt[, mean(age0,  na.rm = TRUE)]
+
+dt[, cesd0_c := cesd0 - m_cesd0]
+dt[, age0_c  := age0  - m_age0]
+
+##（推荐）重算 lag1_* 并给首期填充，避免 NA 影响拟合/预测
+if (!"depression" %in% names(dt)) stop("dt 中找不到 depression 列（主分析应已生成）。")
+if (!"smoken" %in% names(dt))     stop("dt 中找不到 smoken 列。")
+
+dt[, lag1_depression := data.table::shift(depression, 1L, type = "lag"), by = idv]
+dt[, lag1_smoken     := data.table::shift(smoken,     1L, type = "lag"), by = idv]
+dt[is.na(lag1_depression), lag1_depression := depression]
+dt[is.na(lag1_smoken),     lag1_smoken     := smoken]
+
+##------------------------
+## 2) 构造 args_quadB（从主分析复制）
+##    关键：nsimul / nsamples 严格沿用主分析（不自动改）
+##------------------------
+args_quadB <- args_A
+args_quadB$obs_data <- dt
+
+## time_points / interventions 同步更新
+args_quadB$time_points   <- max(dt[[tv]], na.rm = TRUE) + 1L
+args_quadB$interventions <- wrap_time(ints_A, args_quadB$time_points)
+
+## ✅ 严格沿用主分析的 nsimul / nsamples
+args_quadB$nsimul   <- args_A$nsimul
+args_quadB$nsamples <- args_A$nsamples
+
+##------------------------
+## 3) 关键修复：把新基线协变量加入 basecovs
+##------------------------
+base0 <- args_A$basecovs
+if (length(base0) == 1 && is.na(base0)) base0 <- character(0)
+args_quadB$basecovs <- unique(c(base0, "cesd0_c", "age0_c"))
+
+##------------------------
+## 4) 更新 ymodel：加入二次项（基线 CESD/年龄）
+##------------------------
+if (is.null(args_A$ymodel)) stop("args_A$ymodel 为空，无法更新")
+ym0 <- if (inherits(args_A$ymodel, "formula")) args_A$ymodel else as.formula(args_A$ymodel)
+
+args_quadB$ymodel <- update.formula(
+  ym0,
+  . ~ . + cesd0_c + I(cesd0_c^2) + age0_c + I(age0_c^2)
+)
+
+##------------------------
+## 5) 更新 depression 的 covmodel：也加入二次项
+##    并确保 covmodels 顺序与 covnames 完全一致（避免 ordering mismatch）
+##------------------------
+if (is.null(args_A$covparams) || is.null(args_A$covparams$covmodels)) {
+  stop("args_A$covparams$covmodels 不存在，无法更新 depression 的 covmodel。")
+}
+
+cm0 <- args_A$covparams$covmodels
+cm  <- as.list(cm0)
+
+## 若 covmodels 没有名字，用 covnames 赋名
+if (is.null(names(cm)) || any(names(cm) == "")) {
+  if (length(cm) != length(args_A$covnames)) {
+    stop("covmodels 长度与 covnames 不一致，无法自动命名。")
+  }
+  names(cm) <- args_A$covnames
+}
+
+## 找 depression 模型并更新
+if (!"depression" %in% names(cm)) {
+  ## 兜底：按 LHS 查找
+  idx_dep <- which(vapply(cm, function(f) {
+    ff <- if (inherits(f, "formula")) f else as.formula(f)
+    as.character(ff[[2]]) == "depression"
+  }, logical(1)))
+
+  if (length(idx_dep) != 1) {
+    stop(paste0("未能唯一定位 depression 的 covmodel（找到 ", length(idx_dep), " 条）。"))
+  }
+  dep_name <- names(cm)[idx_dep]
+} else {
+  dep_name <- "depression"
+}
+
+ff_dep <- if (inherits(cm[[dep_name]], "formula")) cm[[dep_name]] else as.formula(cm[[dep_name]])
+cm[[dep_name]] <- update.formula(
+  ff_dep,
+  . ~ . + cesd0_c + I(cesd0_c^2) + age0_c + I(age0_c^2)
+)
+
+## 写回 covparams，并按 covnames 顺序输出 covmodels（关键！）
+args_quadB$covparams <- args_A$covparams
+args_quadB$covparams$covmodels <- unname(cm[args_quadB$covnames])
+
+##------------------------
+## 6) 最后保险：确认新列确实在 obs_data 里
+##------------------------
+stopifnot(all(c("cesd0_c", "age0_c") %in% names(args_quadB$obs_data)))
+
+##------------------------
+## 7) 跑 gformula（二次项敏感性分析）
+##------------------------
+set.seed(20260116)
+gform_quadB <- do.call(gformula, args_quadB)
+
+summary(gform_quadB)
+
+if (exists("gform_A")) {
+  cat("\n\n================ 主分析（gform_A）================\n")
+  print(summary(gform_A))
+  cat("\n\n================ 二次项敏感性（gform_quadB）================\n")
+  print(summary(gform_quadB))
+}
+
+
+##==============================================================
+## ELSA 敏感性分析：样条（自然样条 ns）
+## 对：基线 CESD(cesd) 与 基线年龄(agey)
+## 关键：把样条列加入 gfoRmula 的 baseline covariates（basecovs）
+## 参数要求：nsimul / nsamples 严格沿用主分析 args_A（不自动改）
+## 适配你当前主分析（args_A / ints_A / wrap_time 已存在；并保证 covmodels 与 covnames 顺序一致）
+##==============================================================
+
+library(data.table)
+library(dplyr)
+library(splines)
+library(gfoRmula)
+
+##------------------------
+## 0) 基础检查 + 取主分析数据
+##------------------------
+if (!exists("args_A")) stop("未找到 args_A")
+if (!exists("ints_A")) stop("未找到 ints_A")
+if (!exists("wrap_time")) stop("未找到 wrap_time()")
+
+dt <- data.table::copy(as.data.table(args_A$obs_data))
+data.table::setDT(dt)
+
+idv <- args_A$id
+tv  <- args_A$time_name
+
+## 兼容：若 nation 不存在但有 raracem，则补 nation
+if (!"nation" %in% names(dt) && "raracem" %in% names(dt)) {
+  dt[, nation := raracem]
+}
+
+## cesd / agey 列检查（若你数据里用的是别名，这里可自动兜底）
+cesd_col <- if ("cesd" %in% names(dt)) "cesd" else NA_character_
+age_col  <- if ("agey" %in% names(dt)) "agey" else if ("age" %in% names(dt)) "age" else NA_character_
+
+need_cols <- c(idv, tv, cesd_col, age_col)
+miss_cols <- need_cols[is.na(need_cols) | !need_cols %in% names(dt)]
+if (length(miss_cols) > 0) stop(paste0("obs_data 缺少列：", paste(miss_cols, collapse = ", ")))
+
+to_num_safe <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+dt[, cesd_num := to_num_safe(get(cesd_col))]
+dt[, age_num  := to_num_safe(get(age_col))]
+
+##------------------------
+## 1) 每个ID取最早 time 的“基线”CESD / 年龄，并中心化
+##------------------------
+data.table::setorderv(dt, c(idv, tv))
+dt[, tmin := min(get(tv), na.rm = TRUE), by = idv]
+
+dt[, cesd0 := cesd_num[get(tv) == tmin][1], by = idv]
+dt[, age0  := age_num[get(tv)  == tmin][1], by = idv]
+dt[, tmin := NULL]
+
+bad_ids <- dt[is.na(cesd0) | is.na(age0), unique(get(idv))]
+if (length(bad_ids) > 0) {
+  message("剔除基线 cesd0/age0 缺失的ID数：", length(bad_ids))
+  dt <- dt[!get(idv) %in% bad_ids]
+}
+
+dt[, cesd0_c := cesd0 - mean(cesd0, na.rm = TRUE)]
+dt[, age0_c  := age0  - mean(age0,  na.rm = TRUE)]
+
+##------------------------
+## 2) 生成样条基函数列（显式列名，避免 ns() 环境/公式问题）
+##------------------------
+df_cesd <- 3
+df_age  <- 3
+
+B_cesd <- splines::ns(dt$cesd0_c, df = df_cesd)
+colnames(B_cesd) <- paste0("cesd0_ns", seq_len(ncol(B_cesd)))
+dt[, (colnames(B_cesd)) := as.data.table(B_cesd)]
+
+B_age <- splines::ns(dt$age0_c, df = df_age)
+colnames(B_age) <- paste0("age0_ns", seq_len(ncol(B_age)))
+dt[, (colnames(B_age)) := as.data.table(B_age)]
+
+spline_terms <- c(colnames(B_cesd), colnames(B_age))
+stopifnot(all(spline_terms %in% names(dt)))
+
+add_terms_str <- paste(spline_terms, collapse = " + ")
+
+##------------------------
+## 3) 构造 args_spline：复制主分析
+##    ✅ nsimul / nsamples 严格沿用主分析（不自动改）
+##------------------------
+args_spline <- args_A
+args_spline$obs_data <- dt
+
+## time_points / interventions 同步
+args_spline$time_points   <- max(dt[[tv]], na.rm = TRUE) + 1L
+args_spline$interventions <- wrap_time(ints_A, args_spline$time_points)
+
+## ✅ 严格沿用主分析
+args_spline$nsimul   <- args_A$nsimul
+args_spline$nsamples <- args_A$nsamples
+
+##------------------------
+## 4) ★关键：把样条列加入 baseline covariates（basecovs）
+##------------------------
+base0 <- args_A$basecovs
+if (length(base0) == 1 && is.na(base0)) base0 <- character(0)
+args_spline$basecovs <- unique(c(base0, spline_terms))
+
+##------------------------
+## 5) 更新 ymodel：加入样条项（保留原模型所有项）
+##------------------------
+if (is.null(args_A$ymodel)) stop("args_A$ymodel 为空")
+ym0 <- if (inherits(args_A$ymodel, "formula")) args_A$ymodel else as.formula(args_A$ymodel)
+
+args_spline$ymodel <- update.formula(
+  ym0,
+  as.formula(paste(". ~ . +", add_terms_str))
+)
+
+##------------------------
+## 6)（推荐）更新 depression 的 covmodel：也加入样条项
+##    并确保 covmodels 顺序与 covnames 完全一致（避免 ordering mismatch）
+##------------------------
+if (is.null(args_A$covparams) || is.null(args_A$covparams$covmodels)) {
+  stop("args_A$covparams$covmodels 不存在，无法更新 depression 的 covmodel。")
+}
+
+cm <- as.list(args_A$covparams$covmodels)
+
+## 若 covmodels 没名字，且长度与 covnames 一致，则用 covnames 赋名
+if (is.null(names(cm)) || any(names(cm) == "")) {
+  if (length(cm) != length(args_A$covnames)) {
+    stop("covmodels 长度与 covnames 不一致，无法自动命名。")
+  }
+  names(cm) <- args_A$covnames
+}
+
+## 定位 depression 模型并更新
+if ("depression" %in% names(cm)) {
+  dep_name <- "depression"
+} else {
+  idx_dep <- which(vapply(cm, function(f) {
+    ff <- if (inherits(f, "formula")) f else as.formula(f)
+    as.character(ff[[2]]) == "depression"
+  }, logical(1)))
+  if (length(idx_dep) != 1) {
+    stop(paste0("未能唯一定位 depression 的 covmodel（找到 ", length(idx_dep), " 条）。"))
+  }
+  dep_name <- names(cm)[idx_dep]
+}
+
+dep_form <- if (inherits(cm[[dep_name]], "formula")) cm[[dep_name]] else as.formula(cm[[dep_name]])
+cm[[dep_name]] <- update.formula(dep_form, as.formula(paste(". ~ . +", add_terms_str)))
+
+## 写回，并按 covnames 顺序输出（关键！）
+args_spline$covparams <- args_A$covparams
+args_spline$covparams$covmodels <- unname(cm[args_spline$covnames])
+
+##------------------------
+## 7) 最后保险：确认样条列确实在 obs_data 里
+##------------------------
+stopifnot(all(spline_terms %in% names(args_spline$obs_data)))
+
+##------------------------
+## 8) 跑 gformula（样条敏感性分析）
+##------------------------
+set.seed(20260116)
+gform_spline <- do.call(gformula, args_spline)
+
+cat("\n================ 样条敏感性分析（gform_spline）================\n")
+print(summary(gform_spline))
+
+if (exists("gform_A")) {
+  cat("\n================ 主分析（gform_A）================\n")
+  print(summary(gform_A))
+}
+
+
+
+
+
+##==============================================================
+## ELSA：统一导出 gfoRmula 结果为 TSV（Excel 自动按列对齐）
+##==============================================================
+
+## 1) 统一导出函数：兼容 gform$result / gform$results
+export_gform_tsv <- function(gobj, file) {
+  if (is.null(gobj)) stop("gobj is NULL: ", file)
+
+  res <- if (!is.null(gobj$result)) gobj$result else gobj$results
+  if (is.null(res)) stop("No $result or $results found in object: ", file)
+
+  res_final <- as.data.frame(res, check.names = FALSE)
+
+  write.table(res_final,
+              file = file,
+              sep = "\t", quote = FALSE, row.names = FALSE, na = "",
+              fileEncoding = "UTF-8")
+  invisible(res_final)
+}
+
+## 2) 输出目录（改成你自己的）
+out_dir <- "C:/Users/D2646/Desktop/2.7/ELSA/ELSA_gformula_exports"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+fp <- function(fname) file.path(out_dir, fname)
+
+##==============================================================
+## 主分析：Run A / B / C
+##==============================================================
+if (exists("gform_A")) export_gform_tsv(gform_A, fp("ELSA_RunA_main.tsv"))
+if (exists("gform_B")) export_gform_tsv(gform_B, fp("ELSA_RunB_subgroup.tsv"))
+if (exists("gform_C")) export_gform_tsv(gform_C, fp("ELSA_RunC_cesd_score_subgroup.tsv"))
+
+##==============================================================
+## E-value 表（tabA_ev）
+##==============================================================
+if (exists("tabA_ev")) {
+  write.table(as.data.frame(tabA_ev, check.names = FALSE),
+              file = fp("ELSA_Evalue_RunA.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE, na = "",
+              fileEncoding = "UTF-8")
+}
+
+##==============================================================
+## 时间顺序 / 反向因果：lag1 抑郁（gform_A_lag1）
+##==============================================================
+if (exists("gform_A_lag1")) {
+  export_gform_tsv(gform_A_lag1, fp("ELSA_Sens_lag1_depression.tsv"))
+}
+
+##==============================================================
+## 排除早期事件：洗掉 t0==0（gform_lat1）
+##==============================================================
+if (exists("gform_lat1")) {
+  export_gform_tsv(gform_lat1, fp("ELSA_Sens_exclude_early_event.tsv"))
+}
+
+##==============================================================
+## 同波次生成顺序（不加同波次依赖）：gform_A_order / gform_B_order / gform_C_order
+##==============================================================
+if (exists("gform_A_order")) export_gform_tsv(gform_A_order, fp("ELSA_Sens_order_A.tsv"))
+if (exists("gform_B_order")) export_gform_tsv(gform_B_order, fp("ELSA_Sens_order_B.tsv"))
+if (exists("gform_C_order")) export_gform_tsv(gform_C_order, fp("ELSA_Sens_order_C.tsv"))
+
+##==============================================================
+## 同波次生成顺序 + 同波次依赖：gform_a_samewave / gform_b_samewave / gform_c_samewave
+##==============================================================
+if (exists("gform_a_samewave")) export_gform_tsv(gform_a_samewave, fp("ELSA_Sens_order_a_samewave.tsv"))
+if (exists("gform_b_samewave")) export_gform_tsv(gform_b_samewave, fp("ELSA_Sens_order_b_samewave.tsv"))
+if (exists("gform_c_samewave")) export_gform_tsv(gform_c_samewave, fp("ELSA_Sens_order_c_samewave.tsv"))
+
+##==============================================================
+## 暴露不同定义：cut=4 / 5（res_cut4$fit / res_cut5$fit）
+##==============================================================
+if (exists("res_cut4")) export_gform_tsv(res_cut4$fit, fp("ELSA_Sens_dep_cut4.tsv"))
+if (exists("res_cut5")) export_gform_tsv(res_cut5$fit, fp("ELSA_Sens_dep_cut5.tsv"))
+
+##==============================================================
+## MI Rubin pooling 结果表：mi_pooled
+##==============================================================
+if (exists("mi_pooled")) {
+  write.table(as.data.frame(mi_pooled, check.names = FALSE),
+              file = fp("ELSA_Sens_MI_Rubin_pooled.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE, na = "",
+              fileEncoding = "UTF-8")
+}
+
+##==============================================================
+## Complete-case：gform_CC
+##==============================================================
+if (exists("gform_CC")) {
+  export_gform_tsv(gform_CC, fp("ELSA_Sens_complete_case.tsv"))
+}
+
+##==============================================================
+## 二次项：gform_quadB
+##==============================================================
+if (exists("gform_quadB")) {
+  export_gform_tsv(gform_quadB, fp("ELSA_Sens_quadratic_baseline.tsv"))
+}
+
+##==============================================================
+## 样条：gform_spline
+##==============================================================
+if (exists("gform_spline")) {
+  export_gform_tsv(gform_spline, fp("ELSA_Sens_spline_baseline.tsv"))
+}
+
+cat("✅ ELSA exports saved to:\n", out_dir, "\n")
+
+
+
+
+##======================== 基线特征表：按抑郁/非抑郁分层 =======================
+library(dplyr)
+library(gtsummary)
+
+## 1) 取基线：t0==0
+baseline <- rcvd %>% filter(t0 == 0)
+
+## 2) 生成“展示用”的 baseline 表数据（不要用你后面转成0/1的 age_group/income_group）
+baseline_tbl <- baseline %>%
+  transmute(
+    depression = factor(ifelse(depression == 1, "抑郁", "非抑郁"),
+                        levels = c("抑郁", "非抑郁")),
+
+    age_group = factor(ifelse(agey >= 60, "60~", "50~"),
+                       levels = c("50~", "60~")),
+
+    ragender = factor(ifelse(ragender == 1, "男性", "女性"),
+                      levels = c("男性", "女性")),
+
+    nation = factor(ifelse(nation == 1, "白人", "其他"),
+                    levels = c("白人", "其他")),
+
+    raeduc_c = factor(ifelse(raeduc_c == 1, "高中及以上", "低于高中"),
+                      levels = c("低于高中", "高中及以上")),
+
+    smoken = factor(ifelse(smoken == 1, "是", "否"),
+                    levels = c("是", "否")),
+
+    drinkl = factor(ifelse(drinkl == 1, "是", "否"),
+                    levels = c("是", "否")),
+
+    exercise = factor(ifelse(exercise == 1, "有", "无"),
+                      levels = c("有", "无"))
+  )
+
+## 3) 合计行
+n_dep  <- sum(baseline_tbl$depression == "抑郁")
+n_nond <- sum(baseline_tbl$depression == "非抑郁")
+
+tab_elsa <- baseline_tbl %>%
+  tbl_summary(
+    by = depression,
+    type = all_dichotomous() ~ "categorical",   # 二分类显示两行
+    statistic = all_categorical() ~ "{n} ({p}%)",
+    missing = "no",
+    label = list(
+      age_group    ~ "年龄",
+      ragender     ~ "性别",
+      nation       ~ "种族",
+      raeduc_c         ~ "教育程度",
+      smoken       ~ "现在是否吸烟",
+      drinkl           ~ "现在是否饮酒",
+      exercise     ~ "身体活动"
+    )
+  ) %>%
+  modify_spanning_header(all_stat_cols() ~ "**ELSA (N = {N})**") %>%
+  modify_header(all_stat_cols() ~ "**{level} (n = {n})**") %>%
+  bold_labels() %>%
+  modify_footnote(all_stat_cols() ~ NA)
+
+## 插入“合计”行
+add_total_row <- function(tbl, n1, n2, label = "合计") {
+  tb <- tbl$table_body
+  stat_cols <- grep("^stat_", names(tb), value = TRUE)
+
+  new <- tb[0, ]
+  new[1, ] <- NA
+  new$label <- paste0("**", label, "**")
+  new$row_type <- "label"
+  new$variable <- label
+  new[[stat_cols[1]]] <- as.character(n1)
+  new[[stat_cols[2]]] <- as.character(n2)
+
+  tbl$table_body <- dplyr::bind_rows(new, tb)
+  tbl
+}
+
+tab_elsa <- add_total_row(tab_elsa, n_dep, n_nond)
+
+tab_elsa
+
+
+
+
+
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+
+## ============================================================
+## 0) 基础设置
+## ============================================================
+income_labels <- c("low", "medium", "high")
+xlab_k <- "k"
+
+if (!all(na.omit(unique(rcvd$income_group)) %in% 1:3)) {
+  stop("rcvd$income_group 不是 1/2/3，请先修正编码。")
+}
+
+## ============================================================
+## 1) 二元协变量轨迹（折线 + 点，x轴 = k）
+## ============================================================
+plot_bin_traj <- function(dt, ylab) {
+  df <- as.data.frame(dt)
+
+  ggplot(df, aes(x = t0, y = cov, color = legend)) +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 1.8) +
+    labs(x = xlab_k, y = ylab, color = NULL) +
+    theme_bw() +
+    theme(legend.position = "none")
+}
+
+p_smoken <- plot_bin_traj(gform_A$dt_cov_plot$smoken, "smoken")
+p_exer   <- plot_bin_traj(gform_A$dt_cov_plot$exercise, "exercise")+
+  scale_y_continuous(breaks = seq(0.94, 0.96, 0.01), expand = c(0, 0)) +
+  coord_cartesian(ylim = c(0.94, 0.96))
+p_dep    <- plot_bin_traj(gform_A$dt_cov_plot$depression, "depression")
+
+## ============================================================
+## 2) income_group：分面柱图（facet 标题：k=0, k=1, …）
+## ============================================================
+
+# ---- 非参数（观测分布）----
+income_np <- rcvd |>
+  as.data.frame() |>
+  count(t0, income_group) |>
+  group_by(t0) |>
+  mutate(prob = n / sum(n)) |>
+  ungroup() |>
+  mutate(
+    income_group = factor(income_group, levels = 1:3, labels = income_labels),
+    est = "nonparametric estimates"
+  ) |>
+  select(t0, income_group, est, prob)
+
+# ---- 参数（g-formula 输出）----
+ig <- as.data.frame(gform_A$dt_cov_plot$income_group)
+
+prob_col <- intersect(names(ig), c("V1", "prob", "p", "value", "cov"))[1]
+cat_col  <- intersect(names(ig), c("income_group", "value", "cat", "level"))[1]
+
+income_par <- ig |>
+  transmute(
+    t0 = as.integer(t0),
+    income_group = .data[[cat_col]],
+    prob = .data[[prob_col]],
+    est = "parametric g-formula estimates"
+  ) |>
+  mutate(
+    income_group = as.integer(as.character(income_group)),
+    income_group = factor(income_group, levels = 1:3, labels = income_labels)
+  ) |>
+  select(t0, income_group, est, prob)
+
+income_plot <- bind_rows(income_np, income_par) |>
+  tidyr::complete(
+    t0,
+    income_group = factor(income_labels, levels = income_labels),
+    est = c("nonparametric estimates", "parametric g-formula estimates"),
+    fill = list(prob = 0)
+  ) |>
+  mutate(
+    k_lab = factor(paste0("k=", t0), levels = paste0("k=", sort(unique(t0))))
+  )
+
+p_income <- ggplot(income_plot, aes(x = income_group, y = prob, fill = est)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  facet_wrap(~ k_lab, nrow = 1) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "income_group", fill = NULL) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey90")
+  )
+
+## ============================================================
+## 3) risk：折线 + 点（x轴 = k）
+## ============================================================
+out_df <- as.data.frame(gform_A$dt_out_plot)
+risk_col <- intersect(names(out_df), c("risk", "out", "y", "Y"))[1]
+
+p_risk <- ggplot(out_df, aes(x = t0, y = .data[[risk_col]], color = legend)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.8) +
+  labs(x = xlab_k, y = "cumulative risk", color = NULL) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+## ============================================================
+## 4) 拼图（2×3，legend 底部）
+## ============================================================
+legend_bottom <- cowplot::get_legend(
+  ggplot(as.data.frame(gform_A$dt_cov_plot$smoken),
+         aes(x = t0, y = cov, color = legend)) +
+    geom_line() +
+    theme_bw() +
+    theme(legend.position = "bottom") +
+    labs(color = NULL)
+)
+
+main_plot <- (p_income | p_exer) /
+             (p_smoken | p_dep)  /
+             p_risk
+
+final_plot <- cowplot::plot_grid(
+  main_plot,
+  legend_bottom,
+  ncol = 1,
+  rel_heights = c(1, 0.08)
+)
+
+print(final_plot)
